@@ -34,7 +34,10 @@ class Event:
     role: str  # one of ROLES
     kind: str  # one of KINDS
 
-    # text / reasoning / compaction / patch
+    # text / reasoning. NOT patch or compaction: opencode stores a patch as
+    # {"hash":…, "files":[…]} with the diff living in a git object, and a
+    # compaction as a {"tail_start_id":…} marker. Neither carries prose, so
+    # both leave this empty and keep their payload in `raw`.
     text: str = ""
 
     # tool_call only
