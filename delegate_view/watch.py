@@ -1,82 +1,72 @@
 """Terminal UI for watching live agent-to-agent conversations.
 
-Pure rendering functions (render_list, render_convo, session_lines) return
-list[str] with no curses calls or I/O, making them testable as plain data.
-The curses loop in main() only paints lines returned by those functions.
+This module is now only the loop: input, state, and painting what the pure
+functions elsewhere return. The pieces it drives:
 
-resolve_key_action() is a pure mapping from (key, view) -> action string,
-keeping key-handling logic testable without curses.
+    views.py      screens as list[render.Line]  (pure)
+    render.py     styled spans, wrapping, painting
+    theme.py      style name -> curses attribute
+    keys.py       key and SGR-mouse decoding      (pure)
+    scrollbar.py  bar geometry and its inverse    (pure)
+    store.py      the refreshing run list         (threaded)
+
+Keeping the loop this thin is deliberate. Everything that used to be wrong in
+here — colour that bled, a footer that never painted, a wheel that raised
+AttributeError, a scroll bar you could not grab — was logic tangled into the
+curses calls where it could not be tested. What remains is the part that
+genuinely needs a terminal, and nothing else.
 """
 
 from __future__ import annotations
 
 import argparse
 import curses
+import logging
 import os
 import sys
 import threading
 import time
-import textwrap
-from dataclasses import dataclass, field
+import traceback
 
+from delegate_view import views
+from delegate_view.keys import MOUSE_OFF, MOUSE_ON, InputDecoder
+from delegate_view.render import paint
+from delegate_view.scrollbar import (
+    grab_offset,
+    scroll_for_click,
+    scroll_for_thumb_top,
+    thumb_for,
+)
+from delegate_view.theme import Theme
 
-def _relative_age(now: int, started: int) -> str:
-    """Human-readable relative age from now to started (both epoch ms)."""
-    secs = max(0, (now - started) // 1000)
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    return f"{secs // 86400}d"
+_log_path = os.path.join(os.path.expanduser("~"), ".delegate", "watch.log")
+os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+logging.basicConfig(
+    filename=_log_path, level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",
+)
+_log = logging.getLogger("watch")
 
+# How often the spinner advances. The old loop stepped it once per frame at
+# 50fps, which is not an animation so much as a flicker.
+SPIN_MS = 110
 
-def _truncate_path(path: str, width: int) -> str:
-    """Truncate a path to fit in width chars, keeping the filename visible.
+# Frame budget. 20fps is imperceptibly different from 50 for this content and
+# leaves the process mostly asleep.
+TICK_MS = 50
 
-    Always returns at most width characters. When truncation is needed,
-    shows leading ellipsis followed by as much of the filename as fits.
-    """
-    if len(path) <= width:
-        return path
-    if width < 3:
-        return path[:width]
-    name = path.rsplit("/", 1)[-1] if "/" in path else path
-    avail = width - 1  # 1 char for the ellipsis
-    if len(name) >= avail:
-        return "\u2026" + name[-avail:]
-    return "\u2026" + name
-
-
-def _truncate_title(text: str, width: int) -> str:
-    """Clip a session title from the END, keeping the opening words.
-
-    The mirror image of _truncate_path. A title says what the agent was asked
-    to do and says it first ("Fix a scoring bug in /Users/…"), so the front is
-    the part worth keeping.
-    """
-    if len(text) <= width:
-        return text
-    if width < 2:
-        return text[:width]
-    return text[: width - 1] + "\u2026"
-
-
-# ── Pure key-action mapping ──────────────────────────────────────────────
 
 def resolve_key_action(key: int, view: str) -> str:
-    """Map a curses key code + current view to an action string.
+    """Map a key code + current view to an action string. Pure.
 
-    Pure function, no curses calls.  Action strings:
-        quit, back, up, down, top, bottom, select,
-        scroll_up, scroll_down, scroll_top, scroll_bottom,
-        page_up, page_down, half_page_up, half_page_down,
-        mouse_up, mouse_down, noop
+    Kept here rather than in keys.py because it encodes what the *views* do,
+    not how the terminal encodes input.
     """
     if view == "list":
-        if key in (ord("q"), 27):           # q / Esc
+        if key in (ord("q"), 27):
             return "quit"
+        if key == 9:
+            return "toggle_expand"
         if key in (curses.KEY_UP, ord("k")):
             return "up"
         if key in (curses.KEY_DOWN, ord("j")):
@@ -87,25 +77,24 @@ def resolve_key_action(key: int, view: str) -> str:
             return "bottom"
         if key in (10, 13, curses.KEY_ENTER):
             return "select"
-        if key in (curses.KEY_NPAGE,):
+        if key == curses.KEY_NPAGE:
             return "page_down"
-        if key in (curses.KEY_PPAGE,):
+        if key == curses.KEY_PPAGE:
             return "page_up"
-        if key == 4:                        # Ctrl-D
+        if key == 4:
             return "half_page_down"
-        if key == 21:                       # Ctrl-U
+        if key == 21:
             return "half_page_up"
-        if key == curses.KEY_MOUSE:
-            return "mouse"
+        if key == ord("r"):
+            return "refresh"
         if key in (curses.KEY_LEFT, ord("h")):
-            return "noop"                   # left does nothing in list
+            return "noop"
         return "noop"
 
-    # view == "convo"
-    if key in (27, curses.KEY_LEFT, ord("h")):  # Esc / Left / h
+    if key in (27, curses.KEY_LEFT, ord("h"), ord("q")):
         return "back"
-    if key in (ord("q"),):
-        return "back"                       # q in convo goes back, not quit
+    if key == 9:
+        return "toggle_expand"
     if key in (curses.KEY_UP, ord("k")):
         return "scroll_up"
     if key in (curses.KEY_DOWN, ord("j")):
@@ -114,685 +103,440 @@ def resolve_key_action(key: int, view: str) -> str:
         return "scroll_top"
     if key in (ord("G"), curses.KEY_END):
         return "scroll_bottom"
-    if key in (curses.KEY_NPAGE,):
+    if key == curses.KEY_NPAGE:
         return "page_down"
-    if key in (curses.KEY_PPAGE,):
+    if key == curses.KEY_PPAGE:
         return "page_up"
-    if key == 4:                            # Ctrl-D
+    if key == 4:
         return "half_page_down"
-    if key == 21:                           # Ctrl-U
+    if key == 21:
         return "half_page_up"
-    if key == curses.KEY_MOUSE:
-        return "mouse"
     return "noop"
 
 
-# ── Conversation cache ──────────────────────────────────────────────────
+class ConversationLoader:
+    """Loads a conversation off the main thread.
 
-class ConversationCache:
-    """Caches loaded conversation lines keyed by (platform, session_id).
-
-    Only reloads when the run is live AND the transcript file's mtime has
-    changed since the cached copy.  Finished runs are never re-read.
-    At most one reload per second.
+    Pressing Enter used to call the adapter inline, so opening a large session
+    froze the UI for as long as the parse took. Here the request is handed to a
+    worker and the screen keeps painting; the body appears when it is ready.
     """
 
     def __init__(self):
-        self._lines: dict[tuple, list[str]] = {}
-        self._mtime: dict[tuple, float] = {}
-        self._last_load: dict[tuple, float] = {}
+        self._lock = threading.Lock()
+        self._want: tuple | None = None
+        self._have: tuple | None = None
+        self._body: list = []
+        self._title = ""
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
 
-    def get(self, run) -> list[str] | None:
-        """Return cached lines or None if not cached."""
-        key = self._key(run)
-        return self._lines.get(key)
+    def request(self, run) -> None:
+        key = (getattr(run, "platform", ""), getattr(run, "session_id", ""),
+               getattr(run, "transcript", ""))
+        with self._lock:
+            self._want = (key, run)
+        self._ensure_thread()
 
-    def put(self, run, lines: list[str]):
-        """Store lines for a run."""
-        key = self._key(run)
-        self._lines[key] = lines
-        self._last_load[key] = time.monotonic()
-        mtime = self._get_mtime(run)
-        if mtime is not None:
-            self._mtime[key] = mtime
+    def result(self) -> tuple[list, str]:
+        with self._lock:
+            return self._body, self._title
 
-    def needs_reload(self, run) -> bool:
-        """True if the cache is stale or missing and a reload is due."""
-        key = self._key(run)
-        now_mono = time.monotonic()
-        last = self._last_load.get(key, 0.0)
-        # At most once per second
-        if now_mono - last < 1.0:
-            return False
-        if key not in self._lines:
-            return True
-        # Finished runs: never re-read
-        if not run.live:
-            return False
-        # Live run: re-read only if mtime changed
-        cur_mtime = self._get_mtime(run)
-        cached_mtime = self._mtime.get(key)
-        if cur_mtime is not None and cur_mtime != cached_mtime:
-            return True
-        return False
+    def _ensure_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
 
-    @staticmethod
-    def _key(run) -> tuple:
-        return (getattr(run, "platform", "") or "",
-                getattr(run, "session_id", "") or "")
+    def stop(self) -> None:
+        self._stop.set()
 
-    @staticmethod
-    def _get_mtime(run) -> float | None:
-        transcript = getattr(run, "transcript", "")
-        if not transcript:
-            return None
-        try:
-            return os.path.getmtime(transcript)
-        except OSError:
-            return None
+    def _work(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                want = self._want
+            if want is None:
+                return
+            key, run = want
+            if key == self._have:
+                # Live runs keep growing, so re-read on a slow cadence.
+                if not getattr(run, "live", False):
+                    return
+                self._stop.wait(1.0)
+                if self._stop.is_set():
+                    return
+            try:
+                body, title = _load_body(run)
+            except Exception:
+                body, title = [], ""
+            with self._lock:
+                if self._want and self._want[0] == key:
+                    self._body, self._title = body, title
+                    self._have = key
+            if self._want and self._want[0] != key:
+                continue
 
 
-# ── Pure rendering functions ─────────────────────────────────────────────
+def _load_body(run) -> tuple[list, str]:
+    """Build the conversation lines for a run, plus its title."""
+    from delegate_view import adapters
 
-def render_list(
-    runs: list, selected: int, width: int, height: int, now: int,
-    header: str = "",
-) -> list[str]:
-    """Render the landing list screen.
+    title = views.run_title(run)[0] or "conversation"
+    platform = getattr(run, "platform", "") or ""
+    sid = getattr(run, "session_id", "") or ""
+    is_subagent = not getattr(run, "prompt", "")
 
-    Pure function: returns list[str] where each element is one screen line
-    of exactly width chars or fewer.
-
-    Args:
-        runs: list of Run objects (newest first).
-        selected: index of the currently highlighted run.
-        width: terminal width in columns.
-        height: terminal height in rows.
-        now: current epoch ms for age calculations.
-        header: optional status text shown in the first line (e.g.
-                "loading subagents…").
-    """
-    lines: list[str] = []
-    first_line = header if header else "Agent Runs"
-    lines.append(first_line.ljust(width)[:width])
-    lines.append("\u2500" * width)
-
-    if not runs:
-        msg = "  No agent runs yet."
-        lines.append(msg.ljust(width)[:width])
-        blank_count = height - 4
-        for _ in range(max(0, blank_count)):
-            lines.append("".ljust(width)[:width])
-        lines.append(
-            "  q: quit".ljust(width)[:width]
+    if platform and sid:
+        session = adapters.load_session(platform, sid)
+        if session.tokens_in:
+            run.tokens_in = session.tokens_in
+        if session.tokens_out:
+            run.tokens_out = session.tokens_out
+        if session.cost:
+            run.cost = session.cost
+        body = views.session_blocks(
+            session, platform=platform,
+            model=getattr(run, "model", "") or session.model,
+            is_subagent=is_subagent,
         )
-        return lines
+        return body, title
 
-    view_height = height - 3  # header (2 lines) + footer (1 line)
-    view_height = max(1, view_height)
+    # No resolved session: fall back to the raw transcript tail.
+    from delegate_view.render import Span
+    from delegate_view.runs import tail
 
-    if selected < 0:
-        selected = 0
-    if selected >= len(runs):
-        selected = len(runs) - 1
+    raw = tail(getattr(run, "transcript", ""), 500)
+    return [[Span("  " + ln, "dim")] for ln in raw], title
 
-    scroll = 0
-    if selected >= scroll + view_height:
-        scroll = selected - view_height + 1
-    if selected < scroll:
-        scroll = selected
-
-    visible = runs[scroll : scroll + view_height]
-
-    for i, run in enumerate(visible):
-        idx = scroll + i
-        is_selected = (idx == selected)
-        gutter = ">" if is_selected else " "
-        marker = "\u25cf" if run.live else "\u00b7"
-        age = _relative_age(now, run.started)
-        model = getattr(run, "model", "") or ""
-        prompt = getattr(run, "prompt", "") or ""
-        is_path = bool(prompt)
-        if not is_path:
-            prompt = getattr(run, "prompt_text", "") or ""
-
-        # Truncate model and prompt to fit together
-        # gutter(1) + space(1) + marker(1) + space(1) + age + space(1)
-        fixed = 1 + 1 + len(marker) + 1 + len(age) + 1
-        remaining = width - fixed
-        if remaining < 10:
-            row = (f"{gutter} {marker} {age}").ljust(width)[:width]
-            lines.append(row)
-            continue
-
-        model_budget = min(25, remaining // 3)
-        if len(model) > model_budget:
-            model_str = model[: model_budget - 1] + "\u2026"
-        else:
-            model_str = model
-        prompt_budget = remaining - len(model_str) - 1
-        if prompt_budget < 1:
-            prompt_budget = 1
-        if is_path:
-            prompt_trunc = _truncate_path(prompt, prompt_budget)
-        else:
-            prompt_trunc = _truncate_title(prompt, prompt_budget)
-
-        live_tag = " live" if run.live else ""
-        row = f"{gutter} {marker} {age}{live_tag} {model_str} {prompt_trunc}"
-        lines.append(row.ljust(width)[:width])
-
-    # Pad to view_height
-    while len(lines) < 2 + view_height:
-        lines.append("".ljust(width)[:width])
-
-    lines.append(
-        "  j/k/\u2191\u2193:move  Enter:open  q:quit".ljust(width)[:width]
-    )
-    return lines
-
-
-def session_lines(session) -> list[str]:
-    """Convert a Session object into displayable flat lines.
-
-    Pure function: no I/O, no curses.
-    """
-    from delegate_view.schema import Event
-
-    lines: list[str] = []
-    for ev in session.events:
-        if ev.kind == "text":
-            role_prefix = ">" if ev.role == "user" else " "
-            text = ev.text.replace("\r\n", "\n").replace("\r", "\n")
-            for para in text.split("\n"):
-                lines.append(f"{role_prefix} {para}")
-        elif ev.kind == "reasoning":
-            truncated = ev.text[:200]
-            if len(ev.text) > 200:
-                truncated += "\u2026"
-            for ln in truncated.split("\n"):
-                lines.append(f"  ~ {ln}")
-        elif ev.kind == "tool_call":
-            ms = f"{ev.tool_ms}ms" if ev.tool_ms is not None else "pending"
-            lines.append(
-                f"  \u2192 {ev.tool_name} ({ev.tool_status}, {ms})"
-            )
-            if ev.tool_output:
-                out_lines = ev.tool_output.splitlines()
-                shown = out_lines[:10]
-                for ln in shown:
-                    lines.append(f"    {ln}")
-                if len(out_lines) > 10:
-                    lines.append("    \u2026")
-        elif ev.kind == "patch":
-            files = ev.raw.get("files", [])
-            lines.append("  \u00b1 patched: " + ", ".join(files))
-        elif ev.kind == "compaction":
-            lines.append("\u2500\u2500\u2500 context compacted \u2500\u2500\u2500")
-    return lines
-
-
-def render_convo(
-    title: str, lines: list[str], scroll: int, width: int, height: int
-) -> list[str]:
-    """Render the conversation view.
-
-    Pure function: returns list[str] where each element is one screen line
-    of exactly width chars or fewer.
-
-    Args:
-        title: header text.
-        lines: conversation lines (already formatted, not yet word-wrapped).
-        scroll: top of the visible window into the wrapped lines.
-        width: terminal width.
-        height: terminal height.
-    """
-    screen: list[str] = []
-    screen.append(f"  {title}".ljust(width)[:width])
-    screen.append("\u2500" * width)
-
-    # Word-wrap all conversation lines
-    wrapped: list[str] = []
-    indent = 2
-    wrap_width = max(1, width - indent)
-    for ln in lines:
-        if ln == "":
-            wrapped.append("")
-        else:
-            wrapped.extend(textwrap.wrap(ln, wrap_width) or [""])
-
-    view_height = height - 3
-    view_height = max(1, view_height)
-
-    total = len(wrapped)
-    if scroll < 0:
-        scroll = 0
-    if total > 0 and scroll > total - view_height:
-        scroll = max(0, total - view_height)
-
-    visible = wrapped[scroll : scroll + view_height]
-    for ln in visible:
-        padded = ("  " + ln).ljust(width)[:width]
-        screen.append(padded)
-
-    while len(screen) < 2 + view_height:
-        screen.append("".ljust(width)[:width])
-
-    pos = f"{scroll + 1}-{min(scroll + view_height, total)}/{total}"
-    footer = f"  j/k/\u2191\u2193:scroll  Esc:back  {pos}"
-    screen.append(footer.ljust(width)[:width])
-    return screen
-
-
-def _render_once(runs, width, height, now, header=""):
-    """Single-frame render for --once mode (no curses needed)."""
-    lines = render_list(runs, 0, width, height, now, header=header)
-    for line in lines:
-        print(line)
-
-
-# ── Conversation loader (factored out for caching) ──────────────────────
-
-def _load_conversation(run) -> list[str]:
-    """Load conversation lines for a run.
-
-    Tries adapters.load_session first, falls back to tail().
-    """
-    convo_lines: list[str] | None = None
-
-    try:
-        from delegate_view import adapters
-        session = adapters.load_session(
-            run.platform, run.session_id
-        )
-        convo_lines = session_lines(session)
-    except Exception:
-        pass
-
-    if convo_lines is None:
-        try:
-            from delegate_view.runs import tail
-            raw = tail(run.transcript, 500)
-            convo_lines = raw if isinstance(raw, list) else raw.splitlines()
-        except Exception:
-            convo_lines = ["(unable to load conversation)"]
-
-    return convo_lines
-
-
-# ── Main ────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Watch live agent-to-agent conversations"
-    )
-    parser.add_argument(
-        "--ledger", dest="ledger_path", default=None,
-        help="Path to the ledger directory"
-    )
-    parser.add_argument(
-        "--once", action="store_true",
-        help="Render one frame to stdout and exit (no curses)"
-    )
-    parser.add_argument(
-        "--no-subagents", action="store_true",
-        help="Show only delegate.sh runs, not Claude Code subagents"
-    )
-    parser.add_argument(
-        "--subagent-limit", type=int, default=25,
-        help="How many recent subagent conversations to include (default 25)"
-    )
+        description="Watch live agent-to-agent conversations")
+    parser.add_argument("--ledger", dest="ledger_path", default=None,
+                        help="Path to the ledger file")
+    parser.add_argument("--once", action="store_true",
+                        help="Render one frame to stdout and exit (no curses)")
+    parser.add_argument("--no-subagents", action="store_true",
+                        help="Show only delegate.sh runs")
+    parser.add_argument("--subagent-limit", type=int, default=25,
+                        help="How many recent subagent conversations (default 25)")
+    parser.add_argument("--interval", type=float, default=2.0,
+                        help="Seconds between background refreshes")
     args = parser.parse_args()
 
-    try:
-        from delegate_view.runs import load_runs
-    except ImportError:
-        def load_runs(ledger_path=None):
-            return []
-
-    runs = []  # start empty so TUI opens immediately
-    runs_lock = threading.Lock()
-
-    def _load_runs_bg():
-        nonlocal runs
-        try:
-            fresh = load_runs(ledger_path=args.ledger_path, resolve=True)
-            with runs_lock:
-                runs.extend(fresh)
-                runs.sort(key=lambda r: r.started, reverse=True)
-        except Exception:
-            pass
-
-    load_thread = threading.Thread(target=_load_runs_bg, daemon=True)
-    load_thread.start()
-
-    subagent_status = ""  # shown in header while loading
-    subagent_done = threading.Event()
-
-    # Two kinds of agent-to-agent conversation, one list. The ledger covers
-    # work handed out by delegate.sh; subagents covers the ones Claude Code
-    # spawns itself, which never touch the ledger. Either source failing
-    # should cost you that half, not the whole screen.
-    if not args.no_subagents and args.subagent_limit != 0:
-        subagent_status = "loading subagents\u2026"
-
-        def _load_subagents():
-            try:
-                from delegate_view.subagents import load_subagent_runs
-                sa_runs = load_subagent_runs(limit=args.subagent_limit)
-                with runs_lock:
-                    runs.extend(sa_runs)
-                    runs.sort(key=lambda r: r.started, reverse=True)
-            except Exception:
-                pass
-            finally:
-                nonlocal subagent_status
-                subagent_status = ""
-                subagent_done.set()
-
-        sa_thread = threading.Thread(target=_load_subagents, daemon=True)
-        sa_thread.start()
-    else:
-        subagent_done.set()
-
-    runs.sort(key=lambda r: r.started, reverse=True)
+    store = _make_store(args)
+    store.start()
 
     if args.once:
-        # Wait for subagents to finish so --once shows the full picture
-        subagent_done.wait(timeout=5.0)
-        _render_once(runs, 80, 24, int(time.time() * 1000),
-                     header=subagent_status)
+        deadline = time.monotonic() + 5.0
+        while not store.snapshot() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        from delegate_view.render import text_of
+        for ln in views.render_list(store.snapshot(), 0, 80, 24,
+                                    int(time.time() * 1000),
+                                    status=store.status()):
+            print(text_of(ln).rstrip())
+        store.stop()
         return
 
-    def _curses_main(stdscr):
-        nonlocal subagent_status
-
-        curses.curs_set(0)
-        curses.set_escdelay(25)
-        stdscr.timeout(20)
-
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_GREEN, -1)
-
-        # Enable mouse events
-        try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS)
-            # Enable xterm mouse protocol for terminals that need it
-            sys.stdout.write("\033[?1003h")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        sel = 0
-        view = "list"
-        scroll = 0
-        held_action = "noop"
-        last_key = -1
-        last_repeat_ms = 0
-        repeat_delay_ms = 250
-        repeat_rate_ms = 30
-        convo_cache = ConversationCache()
-        cached_convo_lines: list[str] = []
-        cached_convo_title: str = ""
-
-        def _load_and_cache_convo(run_obj):
-            """Load conversation for run_obj, using cache when valid."""
-            lines = convo_cache.get(run_obj)
-            if lines is not None and not convo_cache.needs_reload(run_obj):
-                return lines
-            lines = _load_conversation(run_obj)
-            convo_cache.put(run_obj, lines)
-            return lines
-
-        while True:
-            try:
-                h, w = stdscr.getmaxyx()
-            except curses.error:
-                h, w = 24, 80
-
-            now_ms = int(time.time() * 1000)
-
-            if view == "list":
-                key = stdscr.getch()
-                now_ms = int(time.time() * 1000)
-
-                if key != -1:
-                    action = resolve_key_action(key, "list")
-                    if action == "quit":
-                        break
-                    elif action in ("up", "down"):
-                        if action == "up":
-                            sel = max(0, sel - 1)
-                        else:
-                            n = len(runs_snapshot)
-                            sel = min(n - 1, sel + 1) if n else 0
-                        if key == last_key:
-                            # OS key repeat — same key as last tick
-                            held_action = action
-                            last_repeat_ms = now_ms
-                        else:
-                            # Fresh keypress
-                            held_action = action
-                            last_key = key
-                            last_repeat_ms = now_ms
-                    elif action == "select":
-                        if runs_snapshot and 0 <= sel < len(runs_snapshot):
-                            view = "convo"
-                            scroll = 0
-                            held_action = "noop"
-                            last_key = -1
-                            run_obj = runs_snapshot[sel]
-                            cached_convo_lines = _load_and_cache_convo(run_obj)
-                            cached_convo_title = (
-                                getattr(run_obj, "prompt", "")
-                                or getattr(run_obj, "prompt_text", "")
-                                or "Conversation"
-                            )
-                    elif action == "top":
-                        sel = 0
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "bottom":
-                        sel = len(runs_snapshot) - 1 if runs_snapshot else 0
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "page_down":
-                        page = max(1, h - 3)
-                        n = len(runs_snapshot)
-                        sel = min(n - 1, sel + page) if n else 0
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "page_up":
-                        page = max(1, h - 3)
-                        sel = max(0, sel - page)
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "half_page_down":
-                        half = max(1, (h - 3) // 2)
-                        n = len(runs_snapshot)
-                        sel = min(n - 1, sel + half) if n else 0
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "half_page_up":
-                        half = max(1, (h - 3) // 2)
-                        sel = max(0, sel - half)
-                        held_action = "noop"
-                        last_key = -1
-                    elif action == "mouse":
-                        try:
-                            _, mx, my, _, bstate = curses.getmouse()
-                        except Exception:
-                            pass
-                        else:
-                            if bstate & curses.BUTTON4_PRESSED:
-                                sel = max(0, sel - 3)
-                            elif bstate & curses.BUTTON5_PRESSED:
-                                n = len(runs_snapshot)
-                                sel = min(n - 1, sel + 3) if n else 0
-                        held_action = "noop"
-                        last_key = -1
-                    else:
-                        held_action = "noop"
-                        last_key = -1
-                elif held_action != "noop" and now_ms - last_repeat_ms >= repeat_rate_ms:
-                    # No new key this tick — repeat held action
-                    if held_action == "up":
-                        sel = max(0, sel - 1)
-                    else:
-                        n = len(runs_snapshot)
-                        sel = min(n - 1, sel + 1) if n else 0
-                    last_repeat_ms = now_ms
-                elif held_action != "noop":
-                    # Key released — no input and not time to repeat yet
-                    held_action = "noop"
-                    last_key = -1
-
-                with runs_lock:
-                    runs_snapshot = list(runs)
-                stdscr.erase()
-                now_ms = int(time.time() * 1000)
-                text = render_list(runs_snapshot, sel, w, h, now_ms,
-                                   header=subagent_status)
-                for i, ln in enumerate(text):
-                    try:
-                        if i < h and 0 <= i < h - 1:
-                            stdscr.addnstr(i, 0, ln, w, 0)
-                    except curses.error:
-                        pass
-                stdscr.refresh()
-
-            elif view == "convo":
-                with runs_lock:
-                    runs_snapshot = list(runs)
-                run_obj = (runs_snapshot[sel]
-                           if 0 <= sel < len(runs_snapshot) else None)
-                if run_obj is None:
-                    view = "list"
-                    held_action = "noop"
-                    last_key = -1
-                    continue
-
-                convo_lines = cached_convo_lines
-
-                key = stdscr.getch()
-                now_ms = int(time.time() * 1000)
-
-                if key != -1:
-                    if key == curses.KEY_MOUSE:
-                        try:
-                            _, mx, my, _, bstate = curses.getmouse()
-                        except Exception:
-                            pass
-                        else:
-                            max_scroll = max(0, len(convo_lines) - (h - 3))
-                            if bstate & curses.BUTTON4_PRESSED:
-                                scroll = max(0, scroll - 3)
-                            elif bstate & curses.BUTTON5_PRESSED:
-                                scroll = min(max_scroll, scroll + 3)
-                        held_action = "noop"
-                        last_key = -1
-                    else:
-                        action = resolve_key_action(key, "convo")
-                        max_scroll = max(0, len(convo_lines) - (h - 3))
-                        if action == "back":
-                            view = "list"
-                            scroll = 0
-                            held_action = "noop"
-                            last_key = -1
-                        elif action in ("scroll_up", "scroll_down"):
-                            if action == "scroll_up":
-                                scroll = max(0, scroll - 1)
-                            else:
-                                scroll = min(max_scroll, scroll + 1)
-                            if key == last_key:
-                                held_action = action
-                                last_repeat_ms = now_ms
-                            else:
-                                held_action = action
-                                last_key = key
-                                last_repeat_ms = now_ms
-                        elif action == "scroll_top":
-                            scroll = 0
-                            held_action = "noop"
-                            last_key = -1
-                        elif action == "scroll_bottom":
-                            scroll = max_scroll
-                            held_action = "noop"
-                            last_key = -1
-                        elif action == "page_down":
-                            page = max(1, h - 3)
-                            scroll = min(max_scroll, scroll + page)
-                            held_action = "noop"
-                            last_key = -1
-                        elif action == "page_up":
-                            page = max(1, h - 3)
-                            scroll = max(0, scroll - page)
-                            held_action = "noop"
-                            last_key = -1
-                        elif action == "half_page_down":
-                            half = max(1, (h - 3) // 2)
-                            scroll = min(max_scroll, scroll + half)
-                            held_action = "noop"
-                            last_key = -1
-                        elif action == "half_page_up":
-                            half = max(1, (h - 3) // 2)
-                            scroll = max(0, scroll - half)
-                            held_action = "noop"
-                            last_key = -1
-                        else:
-                            held_action = "noop"
-                            last_key = -1
-                elif held_action != "noop" and now_ms - last_repeat_ms >= repeat_rate_ms:
-                    max_scroll = max(0, len(convo_lines) - (h - 3))
-                    if held_action == "scroll_up":
-                        scroll = max(0, scroll - 1)
-                    else:
-                        scroll = min(max_scroll, scroll + 1)
-                    last_repeat_ms = now_ms
-                elif held_action != "noop":
-                    held_action = "noop"
-                    last_key = -1
-
-                if convo_cache.needs_reload(run_obj):
-                    cached_convo_lines = _load_and_cache_convo(run_obj)
-                    cached_convo_title = (
-                        getattr(run_obj, "prompt", "")
-                        or getattr(run_obj, "prompt_text", "")
-                        or "Conversation"
-                    )
-                    convo_lines = cached_convo_lines
-
-                convo_lines = cached_convo_lines
-                if run_obj.live and scroll >= len(convo_lines) - (h - 3) - 1:
-                    scroll = max(0, len(convo_lines) - (h - 3))
-
-                stdscr.erase()
-                text = render_convo(
-                    cached_convo_title, convo_lines, scroll, w, h
-                )
-                for i, ln in enumerate(text):
-                    try:
-                        if i < h and 0 <= i < h - 1:
-                            stdscr.addnstr(i, 0, ln, w, 0)
-                    except curses.error:
-                        pass
-                stdscr.refresh()
-
     try:
-        curses.wrapper(_curses_main)
+        curses.wrapper(_curses_main, store, args)
     except KeyboardInterrupt:
         pass
-    except Exception:
-        pass
     finally:
-        # Restore terminal: disable xterm mouse reporting
+        store.stop()
         try:
-            sys.stdout.write("\033[?1003l")
+            sys.stdout.write(MOUSE_OFF)
             sys.stdout.flush()
         except Exception:
             pass
+
+
+def _make_store(args):
+    """Build the run store, falling back to a one-shot load if unavailable."""
+    from delegate_view.store import RunStore
+
+    return RunStore(
+        ledger_path=args.ledger_path,
+        subagent_limit=args.subagent_limit,
+        include_subagents=not args.no_subagents,
+        interval=args.interval,
+    )
+
+
+def _curses_main(stdscr, store, args):
+    curses.curs_set(0)
+    curses.set_escdelay(25)
+    stdscr.keypad(True)
+    stdscr.timeout(TICK_MS)
+    stdscr.nodelay(False)
+
+    theme = Theme()
+    theme.start()
+
+    # Mouse: our own SGR mode, not curses' mousemask. See keys.py for why.
+    try:
+        sys.stdout.write(MOUSE_ON)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    decoder = InputDecoder()
+    loader = ConversationLoader()
+
+    view = "list"
+    sel = 0
+    sel_key = None
+    scroll = 0
+    list_scroll = 0
+    expanded = False
+    spin_frame = 0
+    last_spin = 0.0
+    dragging = None      # ("convo"|"list", grab_offset) while a drag is active
+    body: list = []
+    wrapped: list = []
+    wrapped_key = None
+    title = ""
+
+    while True:
+        runs = store.snapshot()
+
+        # Keep the selection on the same conversation across a refresh, which
+        # inserts new runs at the top and would otherwise slide the highlight
+        # onto something the user never chose.
+        if sel_key is not None:
+            idx = _index_of(runs, sel_key)
+            if idx is not None:
+                sel = idx
+        if runs:
+            sel = max(0, min(sel, len(runs) - 1))
+            sel_key = _key_of(runs[sel])
+        else:
+            sel = 0
+            sel_key = None
+
+        h, w = stdscr.getmaxyx()
+        split = view == "convo" and w >= views.SPLIT_MIN_WIDTH
+        # Recomputed every frame from the same function the renderer uses, so
+        # a click maps to the run actually drawn on that row.
+        list_scroll = views.list_scroll_for(sel, list_scroll, h)
+
+        now = time.monotonic()
+        if now - last_spin > SPIN_MS / 1000:
+            spin_frame += 1
+            last_spin = now
+
+        if view == "convo" and runs:
+            loader.request(runs[sel])
+            body, title = loader.result()
+
+        # Wrap once, here, and use the SAME list for painting and for scroll
+        # limits. Wrapping separately in the renderer is what made the last
+        # screenful of a long conversation unreachable — the loop's idea of
+        # how many lines there were came from the unwrapped blocks.
+        convo_w = _convo_width(w, split)
+        if (id(body), convo_w) != wrapped_key:
+            wrapped = views.wrap_body(body, convo_w)
+            wrapped_key = (id(body), convo_w)
+
+        now_ms = int(time.time() * 1000)
+        try:
+            if view == "list":
+                screen = views.render_list(
+                    runs, sel, w, h, now_ms, scroll=list_scroll,
+                    expanded=expanded, spin_frame=spin_frame,
+                    status=store.status())
+            elif split:
+                screen = views.render_split(
+                    runs, sel, wrapped, title, w, h, now_ms, scroll=scroll,
+                    list_scroll=list_scroll, expanded=expanded,
+                    spin_frame=spin_frame, status=store.status())
+            else:
+                screen = views.render_convo(title, wrapped, scroll, w, h)
+        except Exception:
+            _log.error("render failed: %s", traceback.format_exc())
+            screen = []
+
+        stdscr.erase()
+        for y, line in enumerate(screen):
+            if y >= h:
+                break
+            paint(stdscr, y, 0, line, theme)
+        stdscr.refresh()
+
+        # ── input ───────────────────────────────────────────────────────
+        raw = stdscr.getch()
+        if raw == curses.KEY_RESIZE:
+            continue
+        event = decoder.feed(raw)
+        while event is not None:
+            kind, value = event
+            if kind == "mouse":
+                res = _handle_mouse(value, view, split, runs, sel, scroll,
+                                    list_scroll, w, h, len(wrapped), dragging)
+                sel, scroll, list_scroll, dragging, opened = res
+                if opened and runs:
+                    view = "convo"
+                    scroll = 0
+                    sel_key = _key_of(runs[sel])
+            else:
+                action = resolve_key_action(value, view)
+                if action == "quit":
+                    return
+                out = _handle_action(action, view, runs, sel, scroll,
+                                     list_scroll, h, len(wrapped), expanded)
+                view, sel, scroll, list_scroll, expanded, quit_now = out
+                if quit_now:
+                    return
+                if runs and 0 <= sel < len(runs):
+                    sel_key = _key_of(runs[sel])
+            event = decoder.feed(-1)
+
+
+def _key_of(run) -> tuple:
+    sid = getattr(run, "session_id", "") or ""
+    platform = getattr(run, "platform", "") or ""
+    if sid:
+        return (platform, sid)
+    return (getattr(run, "transcript", "") or "", getattr(run, "started", 0))
+
+
+def _index_of(runs, key) -> int | None:
+    for i, r in enumerate(runs):
+        if _key_of(r) == key:
+            return i
+    return None
+
+
+def _handle_action(action, view, runs, sel, scroll, list_scroll, h,
+                   body_len, expanded):
+    """Apply a key action. Returns the new state tuple."""
+    n = len(runs)
+    body_h = views.convo_body_height(h)
+    max_scroll = max(0, body_len - body_h)
+
+    if action == "back":
+        return "list", sel, 0, list_scroll, expanded, False
+    if action == "toggle_expand":
+        return view, sel, scroll, list_scroll, not expanded, False
+    if action == "refresh":
+        return view, sel, scroll, list_scroll, expanded, False
+
+    if view == "list":
+        if action == "up":
+            sel = max(0, sel - 1)
+        elif action == "down":
+            sel = min(n - 1, sel + 1) if n else 0
+        elif action == "top":
+            sel = 0
+        elif action == "bottom":
+            sel = max(0, n - 1)
+        elif action == "page_down":
+            sel = min(n - 1, sel + max(1, h // 3)) if n else 0
+        elif action == "page_up":
+            sel = max(0, sel - max(1, h // 3))
+        elif action == "half_page_down":
+            sel = min(n - 1, sel + max(1, h // 6)) if n else 0
+        elif action == "half_page_up":
+            sel = max(0, sel - max(1, h // 6))
+        elif action == "select" and n:
+            return "convo", sel, 0, list_scroll, expanded, False
+        return view, sel, scroll, list_scroll, expanded, False
+
+    if action == "scroll_up":
+        scroll = max(0, scroll - 1)
+    elif action == "scroll_down":
+        scroll = min(max_scroll, scroll + 1)
+    elif action == "scroll_top":
+        scroll = 0
+    elif action == "scroll_bottom":
+        scroll = max_scroll
+    elif action == "page_down":
+        scroll = min(max_scroll, scroll + body_h)
+    elif action == "page_up":
+        scroll = max(0, scroll - body_h)
+    elif action == "half_page_down":
+        scroll = min(max_scroll, scroll + body_h // 2)
+    elif action == "half_page_up":
+        scroll = max(0, scroll - body_h // 2)
+    return view, sel, scroll, list_scroll, expanded, False
+
+
+def _handle_mouse(ev, view, split, runs, sel, scroll, list_scroll, w, h,
+                  body_len, dragging):
+    """Wheel, click-to-select, and scroll-bar dragging.
+
+    Returns (sel, scroll, list_scroll, dragging, opened).
+    """
+    opened = False
+    body_h = views.convo_body_height(h)
+
+    if ev.is_wheel:
+        step = 3
+        if view == "list" or (split and ev.x < _list_width(w)):
+            sel = (max(0, sel - 1) if ev.is_wheel_up
+                   else (min(len(runs) - 1, sel + 1) if runs else 0))
+        else:
+            if ev.is_wheel_up:
+                scroll = max(0, scroll - step)
+            else:
+                scroll = min(max(0, body_len - body_h), scroll + step)
+        return sel, scroll, list_scroll, dragging, opened
+
+    # Release ends any drag.
+    if not ev.pressed:
+        return sel, scroll, list_scroll, None, opened
+
+    if ev.is_motion:
+        if dragging is not None:
+            which, off = dragging
+            row = ev.y - _body_top()
+            if which == "convo":
+                scroll = scroll_for_thumb_top(row - off, body_len, body_h)
+        return sel, scroll, list_scroll, dragging, opened
+
+    # A fresh press.
+    bar_x = w - 1
+    if ev.x >= bar_x and view != "list":
+        row = ev.y - _body_top()
+        thumb = thumb_for(scroll, body_len, body_h)
+        if thumb is not None and thumb.covers(row):
+            return sel, scroll, list_scroll, ("convo", grab_offset(row, thumb)), opened
+        scroll = scroll_for_click(row, body_len, body_h)
+        return sel, scroll, list_scroll, ("convo", 0), opened
+
+    if view == "list" or (split and ev.x < _list_width(w)):
+        idx = _row_to_index(ev.y, list_scroll)
+        if idx is not None and 0 <= idx < len(runs):
+            if idx == sel:
+                opened = True
+            sel = idx
+    return sel, scroll, list_scroll, dragging, opened
+
+
+def _convo_width(w: int, split: bool) -> int:
+    """Columns the conversation body is wrapped to, in either layout."""
+    return w - _list_width(w) - 1 if split else w
+
+
+def _list_width(w: int) -> int:
+    return max(34, w * 38 // 100)
+
+
+def _body_top() -> int:
+    """First screen row of the scrollable body, in both convo layouts."""
+    return 2
+
+
+def _row_to_index(y: int, list_scroll: int) -> int | None:
+    """Which run a screen row belongs to, or None for header/footer/blank."""
+    body_y = y - _body_top() + list_scroll
+    if body_y < 0:
+        return None
+    per_item = views.ROWS_PER_RUN + 1
+    if body_y % per_item == per_item - 1:
+        return None          # the blank separator row
+    return body_y // per_item
 
 
 if __name__ == "__main__":

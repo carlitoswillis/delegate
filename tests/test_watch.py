@@ -1,776 +1,489 @@
-"""Tests for delegate_view.watch — pure rendering functions, no curses."""
+"""Tests for the TUI: the view functions and the loop's pure helpers.
+
+Ported from the tag-string renderer these replaced. The assertions are about
+behaviour that survived the rewrite — a live run looks different from a
+finished one, the selected row is marked and is the *right* row, nothing
+overflows its width — rather than about the markup the old renderer emitted,
+which was the thing being removed.
+"""
+
+from __future__ import annotations
 
 import curses
-import time
-import threading
 import unittest
-from dataclasses import dataclass, field
-from unittest.mock import patch
 
+from delegate_view import views
+from delegate_view.render import Span, text_of, width_of
 from delegate_view.watch import (
-    render_list,
-    render_convo,
-    session_lines,
-    _relative_age,
-    _truncate_path,
+    _handle_action,
+    _index_of,
+    _key_of,
+    _row_to_index,
     resolve_key_action,
-    ConversationCache,
-    _load_conversation,
 )
-from delegate_view.schema import Event, Session
 
 
-@dataclass
 class FakeRun:
-    started: int = 0
-    prompt: str = ""
-    transcript: str = ""
-    model: str = ""
-    cwd: str = ""
-    continued: bool = False
-    live: bool = False
-    size: int = 0
-    prompt_text: str = ""
-    session_id: str = ""
-    platform: str = ""
-
-
-NOW = 1_700_000_000_000  # fixed epoch ms
-
-
-class TestRenderListLiveMarker(unittest.TestCase):
-    """1. Live runs get a filled marker and 'live'; finished get a dim one."""
-
-    def test_live_run(self):
-        run = FakeRun(live=True, started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 0, 80, 10, NOW)
-        live_rows = [ln for ln in out if "\u25cf" in ln and "live" in ln]
-        self.assertEqual(len(live_rows), 1)
-
-    def test_finished_run(self):
-        run = FakeRun(live=False, started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 0, 80, 10, NOW)
-        self.assertTrue(any("\u00b7" in ln for ln in out))
-        self.assertFalse(any("live" in ln for ln in out))
-
-    def test_both_live_and_finished(self):
-        r1 = FakeRun(live=True, started=NOW, prompt="a.py", model="m")
-        r2 = FakeRun(live=False, started=NOW, prompt="b.py", model="m")
-        out = render_list([r1, r2], 0, 80, 12, NOW)
-        self.assertTrue(any("\u25cf" in ln and "live" in ln for ln in out))
-        self.assertTrue(any("\u00b7" in ln for ln in out))
-
-
-class TestRenderListWidth(unittest.TestCase):
-    """2. Every line from render_list is <= width."""
-
-    def test_normal_width(self):
-        run = FakeRun(
-            live=True, started=NOW, prompt="test.py",
-            model="anthropic/claude-opus-4-20250918"
-        )
-        out = render_list([run], 0, 60, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 60, f"Line too long: {ln!r}")
-
-    def test_very_long_path(self):
-        path = "/very/long/path/to/some/deeply/nested/directory/structure/file.py"
-        run = FakeRun(live=True, started=NOW, prompt=path, model="m")
-        out = render_list([run], 0, 40, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 40, f"Line too long: {ln!r}")
-
-    def test_long_model_name(self):
-        run = FakeRun(
-            live=True, started=NOW, prompt="p.py",
-            model="anthropic/claude-opus-4-20250918-extra-long-model"
-        )
-        out = render_list([run], 0, 50, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 50, f"Line too long: {ln!r}")
-
-    def test_narrow_width(self):
-        run = FakeRun(live=True, started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 0, 20, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 20, f"Line too long: {ln!r}")
-
-
-class TestRenderListScroll(unittest.TestCase):
-    """3. render_list scrolls so the selected index is visible."""
-
-    def test_scroll_to_selected(self):
-        runs = [
-            FakeRun(started=NOW - i * 60000, prompt=f"f{i}.py", model="m")
-            for i in range(20)
-        ]
-        out = render_list(runs, 15, 80, 8, NOW)
-        # height=8, header=2, footer=1, view_height=5
-        # selected=15 should scroll
-        self.assertTrue(
-            any("f15" in ln for ln in out),
-            "Selected run f15.py not visible after scroll",
-        )
-
-    def test_select_top(self):
-        runs = [
-            FakeRun(started=NOW - i * 60000, prompt=f"f{i}.py", model="m")
-            for i in range(20)
-        ]
-        out = render_list(runs, 0, 80, 8, NOW)
-        self.assertTrue(
-            any("f0" in ln for ln in out),
-            "Top run f0.py not visible",
-        )
-
-    def test_select_bottom(self):
-        runs = [
-            FakeRun(started=NOW - i * 60000, prompt=f"f{i}.py", model="m")
-            for i in range(20)
-        ]
-        out = render_list(runs, 19, 80, 8, NOW)
-        self.assertTrue(
-            any("f19" in ln for ln in out),
-            "Bottom run f19.py not visible",
-        )
-
-
-class TestRenderListEmpty(unittest.TestCase):
-    """4. render_list with empty list shows message, does not crash."""
-
-    def test_empty_list(self):
-        out = render_list([], 0, 80, 10, NOW)
-        self.assertTrue(len(out) > 0)
-        self.assertTrue(
-            any("No agent runs yet" in ln for ln in out),
-            "Expected 'No agent runs yet' in empty list output",
-        )
-
-    def test_empty_list_no_crash_on_width(self):
-        out = render_list([], 0, 40, 5, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 40)
-
-
-class TestRelativeAge(unittest.TestCase):
-    """5. Relative age formats: seconds, minutes, hours, days."""
-
-    def test_seconds(self):
-        self.assertEqual(_relative_age(NOW, NOW - 12000), "12s")
-
-    def test_zero_seconds(self):
-        self.assertEqual(_relative_age(NOW, NOW), "0s")
-
-    def test_minutes(self):
-        self.assertEqual(_relative_age(NOW, NOW - 240000), "4m")
-
-    def test_hours(self):
-        self.assertEqual(_relative_age(NOW, NOW - 7200000), "2h")
-
-    def test_days(self):
-        self.assertEqual(_relative_age(NOW, NOW - 259200000), "3d")
-
-
-class TestRenderConvoWrap(unittest.TestCase):
-    """6. render_convo wraps long lines to width, all lines <= width."""
-
-    def test_long_line_wraps(self):
-        long_line = "This is a very long line that should definitely be wrapped to fit within the terminal width boundary."
-        out = render_convo("Test", [long_line], 0, 50, 20)
-        for ln in out:
-            self.assertLessEqual(len(ln), 50, f"Line too long: {ln!r}")
-
-    def test_short_lines_not_broken(self):
-        lines = ["Hello", "World"]
-        out = render_convo("Title", lines, 0, 80, 10)
-        self.assertTrue(
-            any("Hello" in ln for ln in out),
-            "Short line should appear intact",
-        )
-
-    def test_empty_lines(self):
-        out = render_convo("Title", ["", ""], 0, 80, 10)
-        for ln in out:
-            self.assertLessEqual(len(ln), 80)
-
-    def test_many_long_lines_wrap(self):
-        lines = [f"Line {i}: " + "word " * 20 for i in range(5)]
-        out = render_convo("Title", lines, 0, 60, 30)
-        for ln in out:
-            self.assertLessEqual(len(ln), 60, f"Line too long: {ln!r}")
-
-
-class TestSessionLinesReasoning(unittest.TestCase):
-    """7. session_lines truncates reasoning to ~200 chars."""
-
-    def test_long_reasoning_truncated(self):
-        ev = Event(ts=0, role="assistant", kind="reasoning",
-                   text="x" * 500)
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        joined = "\n".join(out)
-        # Should contain the ~200 chars plus an ellipsis
-        self.assertLessEqual(len(joined), 300)
-        self.assertTrue(
-            any("~" in ln for ln in out),
-            "Reasoning lines should have ~ prefix",
-        )
-
-    def test_short_reasoning_not_truncated(self):
-        ev = Event(ts=0, role="assistant", kind="reasoning",
-                   text="short thought")
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        self.assertTrue(any("short thought" in ln for ln in out))
-
-
-class TestSessionLinesPatch(unittest.TestCase):
-    """8. session_lines renders patch file list from raw."""
-
-    def test_patch_with_files(self):
-        ev = Event(
-            ts=0, role="assistant", kind="patch",
-            raw={"files": ["/foo/bar.py", "/baz/qux.py"]}
-        )
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        self.assertTrue(any("\u00b1 patched:" in ln for ln in out))
-        self.assertTrue(any("bar.py" in ln for ln in out))
-        self.assertTrue(any("qux.py" in ln for ln in out))
-
-    def test_patch_empty_files(self):
-        ev = Event(ts=0, role="assistant", kind="patch", raw={})
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        self.assertTrue(any("\u00b1 patched:" in ln for ln in out))
-
-
-class TestSessionLinesToolOutput(unittest.TestCase):
-    """9. session_lines caps tool_output at 10 lines and marks truncation."""
-
-    def test_tool_output_truncated_at_10(self):
-        output_lines = "\n".join([f"out {i}" for i in range(25)])
-        ev = Event(
-            ts=0, role="assistant", kind="tool_call",
-            tool_name="bash", tool_status="completed",
-            tool_ms=100, tool_output=output_lines
-        )
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        # Should have header + 10 output lines + truncation marker
-        self.assertTrue(any("\u2192 bash" in ln for ln in out))
-        indented = [ln for ln in out if ln.startswith("    ")]
-        self.assertLessEqual(len(indented), 11)  # 10 shown + possible truncation
-        self.assertTrue(
-            any("\u2026" in ln for ln in out),
-            "Expected truncation marker",
-        )
-
-    def test_tool_output_no_truncation_when_short(self):
-        ev = Event(
-            ts=0, role="assistant", kind="tool_call",
-            tool_name="bash", tool_status="completed",
-            tool_ms=50, tool_output="line1\nline2"
-        )
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        self.assertTrue(any("line1" in ln for ln in out))
-        self.assertTrue(any("line2" in ln for ln in out))
-
-    def test_compaction_line(self):
-        ev = Event(ts=0, role="assistant", kind="compaction")
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev]
-        )
-        out = session_lines(session)
-        self.assertTrue(
-            any("compacted" in ln for ln in out),
-            "Expected compaction separator",
-        )
-
-    def test_text_role_prefix(self):
-        ev_user = Event(ts=0, role="user", kind="text", text="hello")
-        ev_asst = Event(ts=100, role="assistant", kind="text", text="world")
-        session = Session(
-            id="s1", platform="opencode", title="t", cwd="/",
-            model="m", events=[ev_user, ev_asst]
-        )
-        out = session_lines(session)
-        self.assertTrue(any(ln.startswith("> ") and "hello" in ln for ln in out))
-        self.assertTrue(
-            any(ln.startswith(" ") and "world" in ln for ln in out)
-        )
-
-    def test_truncate_path_helper(self):
-        self.assertEqual(_truncate_path("short.py", 50), "short.py")
-        result = _truncate_path("/a/b/c/longfilename.py", 20)
-        self.assertLessEqual(len(result), 20)
-        self.assertTrue(result.startswith("\u2026"))
-        self.assertIn("longfilename.py", result)
-        # With very narrow width, still respects constraint
-        result_narrow = _truncate_path("/a/b/c/longfilename.py", 12)
-        self.assertLessEqual(len(result_narrow), 12)
-        self.assertTrue(result_narrow.startswith("\u2026"))
-
-    def test_render_list_with_none_model(self):
-        run = FakeRun(live=False, started=NOW, prompt="p.py", model=None)
-        out = render_list([run], 0, 80, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 80)
-
-    def test_render_list_selected_beyond_list(self):
-        run = FakeRun(started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 100, 80, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), 80)
-
-
-# ── New tests for responsive TUI ────────────────────────────────────────
-
-
-class TestConversationCacheCallOnce(unittest.TestCase):
-    """1. The conversation loader is called ONCE for repeated renders of the
-    same finished run."""
-
-    def test_finished_run_loaded_once(self):
-        call_count = 0
-
-        def fake_load_session(platform, session_id):
-            nonlocal call_count
-            call_count += 1
-            return Session(
-                id=session_id, platform=platform, title="t", cwd="/",
-                model="m", events=[Event(ts=0, role="user", kind="text",
-                                         text="hi")]
-            )
-
-        run = FakeRun(platform="opencode", session_id="s1", live=False)
-        cache = ConversationCache()
-
-        # First load
-        lines = cache.get(run)
-        if lines is None or cache.needs_reload(run):
-            with patch("delegate_view.adapters.load_session",
-                       side_effect=fake_load_session):
-                lines = _load_conversation(run)
-            cache.put(run, lines)
-
-        # Simulate 5 more renders — cache should prevent re-loading
-        for _ in range(5):
-            cached = cache.get(run)
-            if cached is not None and not cache.needs_reload(run):
-                lines = cached
-            else:
-                with patch("delegate_view.adapters.load_session",
-                           side_effect=fake_load_session):
-                    lines = _load_conversation(run)
-                cache.put(run, lines)
-
-        # fake_load_session was only called once (by _load_conversation)
-        # The cache.get + needs_reload bypasses _load_conversation entirely
-        # on subsequent calls.  Call count for fake_load_session == 1.
-        self.assertEqual(call_count, 1,
-                         f"Expected loader called once, was called {call_count} times")
-
-
-class TestConversationCacheLiveMtime(unittest.TestCase):
-    """2. A live run whose mtime changed triggers a reload; unchanged does not."""
-
-    def test_unchanged_mtime_no_reload(self):
-        run = FakeRun(platform="opencode", session_id="s1", live=True,
-                      transcript="/tmp/fake_transcript")
-        cache = ConversationCache()
-        cache.put(run, ["cached line"])
-
-        # mtime hasn't changed → needs_reload should be False
-        # We freeze os.path.getmtime to return the same value
-        with patch("delegate_view.watch.os.path.getmtime", return_value=100.0):
-            self.assertFalse(cache.needs_reload(run),
-                             "Unchanged mtime should not trigger reload")
-
-    def test_changed_mtime_triggers_reload(self):
-        run = FakeRun(platform="opencode", session_id="s1", live=True,
-                      transcript="/tmp/fake_transcript")
-        cache = ConversationCache()
-        # Put with mtime = 100
-        with patch("delegate_view.watch.os.path.getmtime", return_value=100.0):
-            cache.put(run, ["cached line"])
-
-        # Change mtime to 200
-        with patch("delegate_view.watch.os.path.getmtime", return_value=200.0):
-            # Need to sleep past the 1-second rate limit
-            cache._last_load[(run.platform, run.session_id)] = time.monotonic() - 2.0
-            self.assertTrue(cache.needs_reload(run),
-                            "Changed mtime should trigger reload")
-
-    def test_finished_run_never_reloads(self):
-        run = FakeRun(platform="opencode", session_id="s1", live=False,
-                      transcript="/tmp/fake_transcript")
-        cache = ConversationCache()
-        with patch("delegate_view.watch.os.path.getmtime", return_value=100.0):
-            cache.put(run, ["cached line"])
-
-        # Even with changed mtime, finished run should not reload
-        with patch("delegate_view.watch.os.path.getmtime", return_value=999.0):
-            cache._last_load[(run.platform, run.session_id)] = time.monotonic() - 2.0
-            self.assertFalse(cache.needs_reload(run),
-                             "Finished run should never reload")
-
-
-class TestResolveKeyAction(unittest.TestCase):
-    """3. resolve_key_action is a pure helper mapping (key, view) -> action."""
-
-    def test_enter_in_list_is_select(self):
-        self.assertEqual(resolve_key_action(10, "list"), "select")
-        self.assertEqual(resolve_key_action(13, "list"), "select")
-        self.assertEqual(resolve_key_action(curses.KEY_ENTER, "list"), "select")
-
-    def test_left_in_list_is_noop(self):
-        self.assertEqual(resolve_key_action(curses.KEY_LEFT, "list"), "noop")
-        self.assertEqual(resolve_key_action(ord("h"), "list"), "noop")
-
-    def test_left_in_convo_is_back(self):
-        self.assertEqual(resolve_key_action(curses.KEY_LEFT, "convo"), "back")
-        self.assertEqual(resolve_key_action(ord("h"), "convo"), "back")
-
-    def test_esc_in_convo_is_back(self):
-        self.assertEqual(resolve_key_action(27, "convo"), "back")
-
-    def test_page_down_in_list(self):
-        self.assertEqual(resolve_key_action(curses.KEY_NPAGE, "list"),
-                         "page_down")
-
-    def test_page_up_in_list(self):
-        self.assertEqual(resolve_key_action(curses.KEY_PPAGE, "list"),
-                         "page_up")
-
-    def test_page_down_in_convo(self):
-        self.assertEqual(resolve_key_action(curses.KEY_NPAGE, "convo"),
-                         "page_down")
-
-    def test_page_up_in_convo(self):
-        self.assertEqual(resolve_key_action(curses.KEY_PPAGE, "convo"),
-                         "page_up")
-
-    def test_ctrl_d_in_list(self):
-        self.assertEqual(resolve_key_action(4, "list"), "half_page_down")
-
-    def test_ctrl_u_in_list(self):
-        self.assertEqual(resolve_key_action(21, "list"), "half_page_up")
-
-    def test_ctrl_d_in_convo(self):
-        self.assertEqual(resolve_key_action(4, "convo"), "half_page_down")
-
-    def test_ctrl_u_in_convo(self):
-        self.assertEqual(resolve_key_action(21, "convo"), "half_page_up")
-
-    def test_mouse_key(self):
-        self.assertEqual(resolve_key_action(curses.KEY_MOUSE, "list"), "mouse")
-        self.assertEqual(resolve_key_action(curses.KEY_MOUSE, "convo"),
-                         "mouse")
-
-
-class TestQuitVsBack(unittest.TestCase):
-    """4. q maps to 'back' in conversation view and 'quit' in list view."""
-
-    def test_q_quit_in_list(self):
+    def __init__(self, started=0, prompt="/p/tasks/task.md", model="m",
+                 live=False, tokens_in=0, tokens_out=0, cost=0.0,
+                 prompt_text="", session_id="", platform="", cwd="/p",
+                 transcript="/p/t.log"):
+        self.started = started
+        self.prompt = prompt
+        self.model = model
+        self.live = live
+        self.tokens_in = tokens_in
+        self.tokens_out = tokens_out
+        self.cost = cost
+        self.prompt_text = prompt_text
+        self.session_id = session_id
+        self.platform = platform
+        self.cwd = cwd
+        self.transcript = transcript
+
+
+def _runs(n, **kw):
+    return [FakeRun(started=1000 * (n - i), prompt=f"/p/tasks/t{i}.md", **kw)
+            for i in range(n)]
+
+
+def _plain(screen):
+    return [text_of(ln) for ln in screen]
+
+
+NOW = 10_000_000
+
+
+# ── list view ───────────────────────────────────────────────────────────
+
+class ListWidthTests(unittest.TestCase):
+    def test_no_line_exceeds_the_width(self):
+        for w in (40, 60, 80, 120, 200):
+            screen = views.render_list(_runs(6), 2, w, 24, NOW)
+            for ln in screen:
+                self.assertLessEqual(width_of(ln), w, f"width={w}")
+
+    def test_narrow_terminal_does_not_raise(self):
+        for w in (10, 20, 30):
+            views.render_list(_runs(3), 0, w, 12, NOW)
+
+    def test_short_terminal_does_not_raise(self):
+        for h in (4, 6, 10):
+            views.render_list(_runs(5), 0, 80, h, NOW)
+
+
+class ListMarkerTests(unittest.TestCase):
+    def test_live_and_finished_runs_look_different(self):
+        live = _plain(views.render_list([FakeRun(live=True)], 0, 80, 12, NOW))
+        idle = _plain(views.render_list([FakeRun(live=False)], 0, 80, 12, NOW))
+        self.assertNotEqual(live, idle)
+
+    def test_live_run_shows_a_spinner_frame(self):
+        out = "\n".join(_plain(
+            views.render_list([FakeRun(live=True)], 0, 80, 12, NOW,
+                              spin_frame=0)))
+        self.assertIn(views.SPINNER[0], out)
+
+    def test_finished_run_shows_a_dot_not_a_spinner(self):
+        out = "\n".join(_plain(
+            views.render_list([FakeRun(live=False)], 0, 80, 12, NOW)))
+        self.assertIn("·", out)
+        for frame in views.SPINNER:
+            self.assertNotIn(frame, out)
+
+
+class SelectionMarkerTests(unittest.TestCase):
+    def test_selected_row_is_marked(self):
+        out = _plain(views.render_list(_runs(3), 0, 80, 16, NOW))
+        self.assertTrue(any("▸" in ln for ln in out))
+
+    def test_marker_is_on_the_selected_row_not_another(self):
+        for sel in (0, 1, 2):
+            out = _plain(views.render_list(_runs(3), sel, 80, 20, NOW))
+            marked = [ln for ln in out if "▸" in ln]
+            self.assertEqual(len(marked), 1, f"sel={sel}")
+            self.assertIn(f"t{sel}", marked[0], f"sel={sel}")
+
+    def test_selected_differs_from_unselected_for_the_same_run(self):
+        a = _plain(views.render_list(_runs(2), 0, 80, 16, NOW))
+        b = _plain(views.render_list(_runs(2), 1, 80, 16, NOW))
+        self.assertNotEqual(a, b)
+
+    def test_a_live_selected_run_is_still_marked(self):
+        out = _plain(views.render_list(
+            [FakeRun(live=True), FakeRun(live=True)], 1, 80, 16, NOW))
+        self.assertTrue(any("▸" in ln for ln in out))
+
+
+class ListScrollTests(unittest.TestCase):
+    def test_selection_past_the_fold_stays_visible(self):
+        runs = _runs(40)
+        screen = views.render_list(runs, 39, 80, 20, NOW)
+        self.assertIn("t39", "\n".join(_plain(screen)))
+
+    def test_first_selection_shows_the_first_run(self):
+        screen = views.render_list(_runs(40), 0, 80, 20, NOW)
+        self.assertIn("t0", "\n".join(_plain(screen)))
+
+
+class ListEmptyTests(unittest.TestCase):
+    def test_empty_list_says_so_and_still_fills_the_screen(self):
+        screen = views.render_list([], 0, 80, 24, NOW)
+        self.assertIn("no runs yet", "\n".join(_plain(screen)))
+        for ln in screen:
+            self.assertLessEqual(width_of(ln), 80)
+
+    def test_header_reports_counts(self):
+        out = "\n".join(_plain(views.render_list(
+            [FakeRun(live=True), FakeRun()], 0, 80, 12, NOW)))
+        self.assertIn("2 runs", out)
+        self.assertIn("1 live", out)
+
+    def test_status_text_reaches_the_header(self):
+        out = "\n".join(_plain(views.render_list(
+            _runs(1), 0, 80, 12, NOW, status="loading subagents…")))
+        self.assertIn("loading subagents", out)
+
+
+class ExpandedTests(unittest.TestCase):
+    def test_expanded_shows_more_than_collapsed(self):
+        run = FakeRun(tokens_in=1000, tokens_out=500, cost=1.25, cwd="/a/proj")
+        plain = "\n".join(_plain(views.render_list([run], 0, 80, 12, NOW,
+                                                   expanded=False)))
+        wide = "\n".join(_plain(views.render_list([run], 0, 80, 12, NOW,
+                                                  expanded=True)))
+        self.assertNotEqual(plain, wide)
+        self.assertIn("proj", wide)
+
+
+# ── formatters ──────────────────────────────────────────────────────────
+
+class RelativeAgeTests(unittest.TestCase):
+    def test_scales(self):
+        self.assertEqual(views.relative_age(30_000, 30_000), "0s")
+        self.assertEqual(views.relative_age(35_000, 30_000), "5s")
+        self.assertEqual(views.relative_age(90_000, 30_000), "1m")
+        self.assertEqual(views.relative_age(3_630_000, 30_000), "1h")
+        self.assertEqual(views.relative_age(86_430_000, 30_000), "1d")
+
+    def test_future_timestamps_do_not_go_negative(self):
+        self.assertEqual(views.relative_age(0, 5000), "0s")
+
+
+class TokenAndCostFormatTests(unittest.TestCase):
+    def test_tokens(self):
+        self.assertEqual(views.format_tokens(0), "")
+        self.assertEqual(views.format_tokens(999), "999")
+        self.assertEqual(views.format_tokens(1200), "1.2K")
+        self.assertEqual(views.format_tokens(45_000), "45K")
+        self.assertEqual(views.format_tokens(3_400_000), "3.4M")
+
+    def test_cost(self):
+        self.assertEqual(views.format_cost(0), "")
+        self.assertEqual(views.format_cost(3.4), "$3.40")
+        self.assertEqual(views.format_cost(0.5), "$0.50")
+
+
+class TaskNameTests(unittest.TestCase):
+    def test_reduces_a_path_to_its_stem(self):
+        self.assertEqual(views.task_name("/a/b/tasks/live-refresh.md"),
+                         "live-refresh")
+
+    def test_handles_a_bare_name(self):
+        self.assertEqual(views.task_name("thing"), "thing")
+
+    def test_subagent_run_uses_its_prompt_text(self):
+        run = FakeRun(prompt="", prompt_text="Find the scoring bug")
+        title, is_path = views.run_title(run)
+        self.assertEqual(title, "Find the scoring bug")
+        self.assertFalse(is_path)
+
+
+# ── conversation view ───────────────────────────────────────────────────
+
+class FakeEvent:
+    def __init__(self, kind, role="assistant", text="", tool_name="",
+                 tool_output="", tool_status="completed", tool_ms=5, raw=None):
+        self.kind = kind
+        self.role = role
+        self.text = text
+        self.tool_name = tool_name
+        self.tool_output = tool_output
+        self.tool_status = tool_status
+        self.tool_ms = tool_ms
+        self.raw = raw or {}
+
+
+class FakeSession:
+    def __init__(self, events, model="opencode/big-pickle",
+                 platform="opencode"):
+        self.events = events
+        self.model = model
+        self.platform = platform
+
+
+class SessionBlockTests(unittest.TestCase):
+    def test_user_turn_is_labelled_by_delegator_not_the_word_user(self):
+        s = FakeSession([FakeEvent("text", role="user", text="do the thing")])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("you → big-pickle", out)
+        self.assertNotIn("user", out)
+
+    def test_assistant_turn_is_labelled_with_the_model(self):
+        s = FakeSession([FakeEvent("text", role="assistant", text="done")])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("big-pickle", out)
+
+    def test_subagent_prompt_is_attributed_to_claude(self):
+        s = FakeSession([FakeEvent("text", role="user", text="go")],
+                        model="claude-sonnet-5", platform="claude-code")
+        out = "\n".join(text_of(l)
+                        for l in views.session_blocks(s, is_subagent=True))
+        self.assertIn("claude →", out)
+
+    def test_reasoning_is_truncated(self):
+        s = FakeSession([FakeEvent("reasoning", text="x" * 500)])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("…", out)
+        self.assertLess(len(out), 400)
+
+    def test_tool_call_shows_name_and_timing(self):
+        s = FakeSession([FakeEvent("tool_call", tool_name="read", tool_ms=12)])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("read", out)
+        self.assertIn("12ms", out)
+
+    def test_failed_tool_call_is_marked_differently(self):
+        ok = FakeSession([FakeEvent("tool_call", tool_name="read")])
+        bad = FakeSession([FakeEvent("tool_call", tool_name="read",
+                                     tool_status="error")])
+        self.assertNotEqual(
+            "\n".join(text_of(l) for l in views.session_blocks(ok)),
+            "\n".join(text_of(l) for l in views.session_blocks(bad)))
+
+    def test_long_tool_output_is_capped_with_a_count(self):
+        s = FakeSession([FakeEvent("tool_call", tool_name="ls",
+                                   tool_output="\n".join(str(i)
+                                                         for i in range(40)))])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("more lines", out)
+
+    def test_patch_lists_its_files(self):
+        s = FakeSession([FakeEvent("patch", raw={"files": ["a.py", "b.py"]})])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("a.py", out)
+        self.assertIn("b.py", out)
+
+    def test_compaction_is_marked(self):
+        s = FakeSession([FakeEvent("compaction")])
+        out = "\n".join(text_of(l) for l in views.session_blocks(s))
+        self.assertIn("compacted", out)
+
+
+class ConvoRenderTests(unittest.TestCase):
+    def _body(self, n=60):
+        s = FakeSession([FakeEvent("text", text=f"line {i}") for i in range(n)])
+        return views.session_blocks(s)
+
+    def test_no_line_exceeds_width(self):
+        for w in (40, 80, 132):
+            for ln in views.render_convo("t", self._body(), 0, w, 24):
+                self.assertLessEqual(width_of(ln), w, f"w={w}")
+
+    def test_scroll_changes_what_is_shown(self):
+        top = _plain(views.render_convo("t", self._body(), 0, 80, 20))
+        down = _plain(views.render_convo("t", self._body(), 20, 80, 20))
+        self.assertNotEqual(top, down)
+
+    def test_scroll_is_clamped_at_both_ends(self):
+        body = self._body()
+        low = _plain(views.render_convo("t", body, -50, 80, 20))
+        zero = _plain(views.render_convo("t", body, 0, 80, 20))
+        self.assertEqual(low, zero)
+        far = _plain(views.render_convo("t", body, 99_999, 80, 20))
+        self.assertEqual(len(far), len(zero))
+
+    def test_title_is_shown(self):
+        out = "\n".join(_plain(views.render_convo("my-task", self._body(),
+                                                  0, 80, 20)))
+        self.assertIn("my-task", out)
+
+    def test_wrapping_keeps_the_rule_on_continuations(self):
+        s = FakeSession([FakeEvent("text", text="word " * 60)])
+        wrapped = views.wrap_all(views.session_blocks(s), 40)
+        ruled = [text_of(l) for l in wrapped if views.RULE in text_of(l)]
+        self.assertGreater(len(ruled), 1,
+                           "a long paragraph must stay one ruled block")
+
+
+class SplitViewTests(unittest.TestCase):
+    def test_split_fills_exactly_the_width(self):
+        body = views.session_blocks(
+            FakeSession([FakeEvent("text", text="hi")]))
+        for w in (100, 120, 160):
+            for ln in views.render_split(_runs(5), 1, body, "t", w, 24, NOW):
+                self.assertEqual(width_of(ln), w, f"w={w}")
+
+    def test_split_has_one_row_per_screen_line(self):
+        body = views.session_blocks(
+            FakeSession([FakeEvent("text", text="hi")]))
+        self.assertEqual(len(views.render_split(_runs(3), 0, body, "t",
+                                                120, 24, NOW)), 24)
+
+
+# ── key handling ────────────────────────────────────────────────────────
+
+class ResolveKeyActionTests(unittest.TestCase):
+    def test_enter_selects_in_the_list(self):
+        for k in (10, 13, curses.KEY_ENTER):
+            self.assertEqual(resolve_key_action(k, "list"), "select")
+
+    def test_q_quits_the_list_but_only_goes_back_in_a_convo(self):
         self.assertEqual(resolve_key_action(ord("q"), "list"), "quit")
-
-    def test_q_back_in_convo(self):
         self.assertEqual(resolve_key_action(ord("q"), "convo"), "back")
 
-    def test_esc_always_back_in_convo(self):
-        self.assertEqual(resolve_key_action(27, "convo"), "back")
+    def test_escape_and_left_go_back_from_a_convo(self):
+        for k in (27, curses.KEY_LEFT, ord("h")):
+            self.assertEqual(resolve_key_action(k, "convo"), "back")
 
-    def test_esc_quit_in_list(self):
-        self.assertEqual(resolve_key_action(27, "list"), "quit")
+    def test_left_does_nothing_in_the_list(self):
+        self.assertEqual(resolve_key_action(curses.KEY_LEFT, "list"), "noop")
 
+    def test_vim_and_arrow_keys_agree(self):
+        self.assertEqual(resolve_key_action(ord("j"), "list"),
+                         resolve_key_action(curses.KEY_DOWN, "list"))
+        self.assertEqual(resolve_key_action(ord("k"), "convo"),
+                         resolve_key_action(curses.KEY_UP, "convo"))
 
-class TestMergeSubagentPreservesSelection(unittest.TestCase):
-    """5. Merging subagent runs preserves the selected run's identity when the
-    list grows underneath it."""
+    def test_paging_keys(self):
+        self.assertEqual(resolve_key_action(curses.KEY_NPAGE, "list"),
+                         "page_down")
+        self.assertEqual(resolve_key_action(curses.KEY_PPAGE, "convo"),
+                         "page_up")
+        self.assertEqual(resolve_key_action(4, "list"), "half_page_down")
+        self.assertEqual(resolve_key_action(21, "convo"), "half_page_up")
 
-    def test_identity_preserved_after_merge(self):
-        # Start with 3 runs, select the second one
-        r1 = FakeRun(started=300, prompt="a.py", session_id="s1",
-                     platform="opencode")
-        r2 = FakeRun(started=200, prompt="b.py", session_id="s2",
-                     platform="opencode")
-        r3 = FakeRun(started=100, prompt="c.py", session_id="s3",
-                     platform="opencode")
-        runs = [r1, r2, r3]
-        sel = 1  # pointing at r2
+    def test_tab_toggles_detail_in_both_views(self):
+        self.assertEqual(resolve_key_action(9, "list"), "toggle_expand")
+        self.assertEqual(resolve_key_action(9, "convo"), "toggle_expand")
 
-        original_run = runs[sel]
-        self.assertEqual(original_run.session_id, "s2")
-
-        # Simulate subagent merge: add new runs and re-sort
-        r4 = FakeRun(started=250, prompt="d.py", session_id="s4",
-                     platform="claude-code")
-        runs.append(r4)
-        runs.sort(key=lambda r: r.started, reverse=True)
-
-        # Re-resolve selection by identity (session_id), not index
-        new_sel = next(
-            (i for i, r in enumerate(runs)
-             if r.session_id == original_run.session_id),
-            0
-        )
-        self.assertEqual(runs[new_sel].session_id, "s2")
-        # r2 (started=200) should now be at index 2 (after r1@300, r4@250)
-        self.assertEqual(new_sel, 2)
+    def test_unknown_keys_are_noops(self):
+        self.assertEqual(resolve_key_action(ord("z"), "list"), "noop")
+        self.assertEqual(resolve_key_action(ord("z"), "convo"), "noop")
 
 
-class TestSubagentLimitZero(unittest.TestCase):
-    """6. --subagent-limit 0 results in no subagent load being attempted."""
+class HandleActionTests(unittest.TestCase):
+    def _act(self, action, view="list", runs=None, sel=0, scroll=0,
+             body_len=100, expanded=False):
+        runs = _runs(10) if runs is None else runs
+        return _handle_action(action, view, runs, sel, scroll, 0, 24,
+                              body_len, expanded)
 
-    def test_limit_zero_skips_load(self):
-        import argparse
-        from unittest.mock import patch as mock_patch
+    def test_movement_is_clamped_at_both_ends(self):
+        self.assertEqual(self._act("up", sel=0)[1], 0)
+        self.assertEqual(self._act("down", sel=9)[1], 9)
 
-        # Simulate parsing --subagent-limit 0
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--subagent-limit", type=int, default=25)
-        parser.add_argument("--no-subagents", action="store_true")
-        args = parser.parse_args(["--subagent-limit", "0"])
+    def test_top_and_bottom(self):
+        self.assertEqual(self._act("top", sel=5)[1], 0)
+        self.assertEqual(self._act("bottom", sel=0)[1], 9)
 
-        # The condition in main() is:
-        #   if not args.no_subagents and args.subagent_limit != 0:
-        should_load = (not args.no_subagents and args.subagent_limit != 0)
-        self.assertFalse(should_load,
-                         "--subagent-limit 0 should skip subagent loading")
+    def test_select_switches_view_and_resets_scroll(self):
+        view, sel, scroll, _, _, _ = self._act("select", sel=3, scroll=40)
+        self.assertEqual(view, "convo")
+        self.assertEqual(scroll, 0)
+        self.assertEqual(sel, 3)
 
-    def test_limit_nonzero_would_load(self):
-        import argparse
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--subagent-limit", type=int, default=25)
-        parser.add_argument("--no-subagents", action="store_true")
-        args = parser.parse_args(["--subagent-limit", "10"])
+    def test_back_returns_to_the_list(self):
+        self.assertEqual(self._act("back", view="convo")[0], "list")
 
-        should_load = (not args.no_subagents and args.subagent_limit != 0)
-        self.assertTrue(should_load,
-                        "--subagent-limit 10 should trigger subagent loading")
+    def test_convo_scrolling_is_clamped(self):
+        self.assertEqual(self._act("scroll_up", view="convo", scroll=0)[2], 0)
+        far = self._act("scroll_bottom", view="convo", body_len=100)[2]
+        self.assertEqual(far, 100 - views.convo_body_height(24))
 
+    def test_toggle_expand_flips(self):
+        self.assertTrue(self._act("toggle_expand", expanded=False)[4])
+        self.assertFalse(self._act("toggle_expand", expanded=True)[4])
 
-class TestRenderListHeader(unittest.TestCase):
-    """7. render_list shows custom header when provided."""
-
-    def test_custom_header(self):
-        run = FakeRun(started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 0, 80, 10, NOW, header="loading subagents\u2026")
-        self.assertTrue(any("loading subagents" in ln for ln in out))
-
-    def test_default_header(self):
-        run = FakeRun(started=NOW, prompt="p.py", model="m")
-        out = render_list([run], 0, 80, 10, NOW)
-        self.assertTrue(any("Agent Runs" in ln for ln in out))
+    def test_empty_list_movement_does_not_raise(self):
+        for action in ("up", "down", "top", "bottom", "select"):
+            self._act(action, runs=[])
 
 
-class TestKeyBindingsComplete(unittest.TestCase):
-    """8. All requested key bindings are present and mapped correctly."""
+class SelectionIdentityTests(unittest.TestCase):
+    def test_key_is_stable_for_the_same_run(self):
+        r = FakeRun(session_id="s1", platform="opencode")
+        self.assertEqual(_key_of(r), _key_of(r))
 
-    def test_up_down_in_list(self):
-        self.assertEqual(resolve_key_action(curses.KEY_UP, "list"), "up")
-        self.assertEqual(resolve_key_action(ord("k"), "list"), "up")
-        self.assertEqual(resolve_key_action(curses.KEY_DOWN, "list"), "down")
-        self.assertEqual(resolve_key_action(ord("j"), "list"), "down")
+    def test_unresolved_runs_fall_back_to_transcript_and_start(self):
+        r = FakeRun(session_id="", transcript="/t.log", started=42)
+        self.assertEqual(_key_of(r), ("/t.log", 42))
 
-    def test_g_G_in_list(self):
-        self.assertEqual(resolve_key_action(ord("g"), "list"), "top")
-        self.assertEqual(resolve_key_action(curses.KEY_HOME, "list"), "top")
-        self.assertEqual(resolve_key_action(ord("G"), "list"), "bottom")
-        self.assertEqual(resolve_key_action(curses.KEY_END, "list"), "bottom")
+    def test_index_of_finds_a_run_and_survives_an_insertion(self):
+        runs = _runs(3)
+        key = _key_of(runs[1])
+        self.assertEqual(_index_of(runs, key), 1)
+        # A refresh prepends a newer run; the selection must follow the key.
+        runs.insert(0, FakeRun(prompt="/p/tasks/new.md", started=99_999))
+        self.assertEqual(_index_of(runs, key), 2)
 
-    def test_scroll_bindings_in_convo(self):
-        self.assertEqual(resolve_key_action(curses.KEY_UP, "convo"),
-                         "scroll_up")
-        self.assertEqual(resolve_key_action(ord("k"), "convo"), "scroll_up")
-        self.assertEqual(resolve_key_action(curses.KEY_DOWN, "convo"),
-                         "scroll_down")
-        self.assertEqual(resolve_key_action(ord("j"), "convo"), "scroll_down")
-
-    def test_g_G_in_convo(self):
-        self.assertEqual(resolve_key_action(ord("g"), "convo"), "scroll_top")
-        self.assertEqual(resolve_key_action(curses.KEY_HOME, "convo"),
-                         "scroll_top")
-        self.assertEqual(resolve_key_action(ord("G"), "convo"),
-                         "scroll_bottom")
-        self.assertEqual(resolve_key_action(curses.KEY_END, "convo"),
-                         "scroll_bottom")
+    def test_index_of_returns_none_for_an_unknown_key(self):
+        self.assertIsNone(_index_of(_runs(3), ("nope", "nope")))
 
 
-class TestConversationCacheRateLimit(unittest.TestCase):
-    """9. Cache reload is rate-limited to at most once per second."""
+class RowToIndexTests(unittest.TestCase):
+    def test_header_rows_are_not_runs(self):
+        self.assertIsNone(_row_to_index(0, 0))
+        self.assertIsNone(_row_to_index(1, 0))
 
-    def test_rate_limit_prevents_rapid_reload(self):
-        run = FakeRun(platform="op", session_id="s1", live=True,
-                      transcript="/tmp/t")
-        cache = ConversationCache()
-        with patch("delegate_view.watch.os.path.getmtime", return_value=1.0):
-            cache.put(run, ["line"])
+    def test_first_run_occupies_the_first_body_rows(self):
+        self.assertEqual(_row_to_index(2, 0), 0)
+        self.assertEqual(_row_to_index(3, 0), 0)
 
-        # Immediately change mtime
-        with patch("delegate_view.watch.os.path.getmtime", return_value=2.0):
-            # Should be False because less than 1 second has passed
-            self.assertFalse(cache.needs_reload(run),
-                             "Rate limit should prevent immediate reload")
+    def test_blank_separator_row_is_not_a_run(self):
+        self.assertIsNone(_row_to_index(4, 0))
 
+    def test_second_run_follows_the_separator(self):
+        self.assertEqual(_row_to_index(5, 0), 1)
 
-# ── Selection marker tests ──────────────────────────────────────────────
-
-
-class TestSelectionMarkerDiffers(unittest.TestCase):
-    """render_list output DIFFERS between selected=0 and selected=1."""
-
-    def test_different_selected_produces_different_output(self):
-        runs = [
-            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
-            for i in range(5)
-        ]
-        out0 = render_list(runs, 0, 80, 10, NOW)
-        out1 = render_list(runs, 1, 80, 10, NOW)
-        self.assertNotEqual(out0, out1,
-                            "render_list should differ between selected=0 and selected=1")
-
-
-class TestSelectionMarkerOnCorrectRow(unittest.TestCase):
-    """The selected row carries '>' and non-selected rows carry ' '."""
-
-    def test_selected_row_has_gutter(self):
-        runs = [
-            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
-            for i in range(5)
-        ]
-        out = render_list(runs, 2, 80, 10, NOW)
-        # Lines 2-6 are the run rows (0=header, 1=separator)
-        run_rows = out[2:7]
-        self.assertTrue(run_rows[2].startswith(">"),
-                        f"Selected row should start with >, got {run_rows[2]!r}")
-        for i, row in enumerate(run_rows):
-            if i != 2:
-                self.assertTrue(row.startswith(" "),
-                                f"Non-selected row {i} should start with space, got {row!r}")
-
-    def test_only_one_selected_row(self):
-        runs = [
-            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
-            for i in range(5)
-        ]
-        out = render_list(runs, 3, 80, 10, NOW)
-        run_rows = out[2:7]
-        gutter_count = sum(1 for r in run_rows if r.startswith(">"))
-        self.assertEqual(gutter_count, 1,
-                         f"Exactly one row should be selected, found {gutter_count}")
-
-
-class TestSelectionMarkerAfterScroll(unittest.TestCase):
-    """Selection marker is correct when selected is near the end and list has
-    scrolled."""
-
-    def test_scrolled_selection_marker(self):
-        # 20 runs, height=8 → view_height=5, so selected=18 should scroll
-        runs = [
-            FakeRun(started=NOW - i * 60000, prompt=f"f{i}.py", model="m")
-            for i in range(20)
-        ]
-        out = render_list(runs, 18, 80, 8, NOW)
-        # Run rows are at indices 2..6 (view_height=5)
-        run_rows = out[2:7]
-        # The selected run is f18.py; find which screen row has it
-        marked_idx = None
-        for i, row in enumerate(run_rows):
-            if row.startswith(">"):
-                marked_idx = i
-                self.assertIn("f18", row,
-                              f"Marked row should contain f18, got {row!r}")
-                break
-        self.assertIsNotNone(marked_idx, "No marked row found after scroll")
-
-
-class TestSelectionMarkerWidthGuarantee(unittest.TestCase):
-    """Width guarantee holds with the gutter for various widths."""
-
-    def _check_width(self, width):
-        run = FakeRun(
-            started=NOW, prompt="/very/long/path/to/some/file.py",
-            model="anthropic/claude-opus-4-20250918-extra-long"
-        )
-        out = render_list([run], 0, width, 10, NOW)
-        for ln in out:
-            self.assertLessEqual(len(ln), width,
-                                 f"Line too long at width={width}: {ln!r}")
-
-    def test_width_20(self):
-        self._check_width(20)
-
-    def test_width_40(self):
-        self._check_width(40)
-
-    def test_width_80(self):
-        self._check_width(80)
-
-    def test_width_200(self):
-        self._check_width(200)
-
-    def test_width_30(self):
-        self._check_width(30)
-
-
-class TestSelectedFinishedRunMarked(unittest.TestCase):
-    """A selected FINISHED run is visibly marked."""
-
-    def test_finished_selected_has_gutter(self):
-        run = FakeRun(started=NOW, prompt="done.py", model="m", live=False)
-        out = render_list([run], 0, 80, 10, NOW)
-        run_rows = out[2:3]  # single run
-        self.assertTrue(run_rows[0].startswith(">"),
-                        f"Selected finished run should start with >, got {run_rows[0]!r}")
-        self.assertIn("\u00b7", run_rows[0],
-                      "Finished run should still have the · marker")
-
-
-class TestLiveAndSelectedDistinguishable(unittest.TestCase):
-    """A live run and a selected run are distinguishable when different rows."""
-
-    def test_live_unselected_vs_finished_selected(self):
-        r_live = FakeRun(started=NOW, prompt="live.py", model="m", live=True)
-        r_done = FakeRun(started=NOW, prompt="done.py", model="m", live=False)
-        out = render_list([r_live, r_done], 1, 80, 10, NOW)
-        run_rows = out[2:4]
-        # Row 0: live, unselected → "  ● ...live"
-        self.assertTrue(run_rows[0].startswith(" "),
-                        "Live unselected should start with space")
-        self.assertIn("\u25cf", run_rows[0],
-                      "Live run should have ● marker")
-        self.assertIn("live", run_rows[0],
-                      "Live run should have 'live' tag")
-        # Row 1: finished, selected → "> · ...done"
-        self.assertTrue(run_rows[1].startswith(">"),
-                        "Selected finished should start with >")
-        self.assertIn("\u00b7", run_rows[1],
-                      "Finished run should have · marker")
-        self.assertNotIn("live", run_rows[1],
-                         "Finished run should not have 'live' tag")
+    def test_scrolling_shifts_the_mapping(self):
+        self.assertEqual(_row_to_index(2, 3), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListScrollMappingTests(unittest.TestCase):
+    """The renderer and the click handler must agree on where the list is.
+
+    Regression guard: the renderer used to compute this internally while the
+    loop kept a copy that never changed, so on a scrolled list a click landed
+    on the right screen row but the wrong run.
+    """
+
+    def test_scroll_follows_the_selection_downwards(self):
+        s = views.list_scroll_for(20, 0, 24)
+        self.assertGreater(s, 0)
+
+    def test_scroll_follows_the_selection_upwards(self):
+        self.assertEqual(views.list_scroll_for(0, 30, 24), 0)
+
+    def test_scroll_is_stable_when_selection_is_already_visible(self):
+        s1 = views.list_scroll_for(10, 0, 40)
+        self.assertEqual(views.list_scroll_for(10, s1, 40), s1)
+
+    def test_click_maps_back_to_the_selected_run_when_scrolled(self):
+        # Render a scrolled list, then ask which run each body row belongs to
+        # and check the marked row maps back to the selection.
+        sel, h = 20, 24
+        scroll = views.list_scroll_for(sel, 0, h)
+        screen = views.render_list(_runs(40), sel, 80, h, NOW, scroll=scroll)
+        marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
+        self.assertEqual(len(marked), 1)
+        self.assertEqual(_row_to_index(marked[0], scroll), sel)
+
+    def test_click_maps_correctly_at_the_top_of_an_unscrolled_list(self):
+        screen = views.render_list(_runs(10), 0, 80, 24, NOW, scroll=0)
+        marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
+        self.assertEqual(_row_to_index(marked[0], 0), 0)
