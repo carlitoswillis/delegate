@@ -43,6 +43,20 @@ def _truncate_path(path: str, width: int) -> str:
     return "\u2026" + name
 
 
+def _truncate_title(text: str, width: int) -> str:
+    """Clip a session title from the END, keeping the opening words.
+
+    The mirror image of _truncate_path. A title says what the agent was asked
+    to do and says it first ("Fix a scoring bug in /Users/…"), so the front is
+    the part worth keeping.
+    """
+    if len(text) <= width:
+        return text
+    if width < 2:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
 def render_list(
     runs: list, selected: int, width: int, height: int, now: int
 ) -> list[str]:
@@ -94,7 +108,17 @@ def render_list(
         marker = "\u25cf" if run.live else "\u00b7"
         age = _relative_age(now, run.started)
         model = getattr(run, "model", "") or ""
+        # Subagent conversations have no prompt FILE — delegate.sh never saw
+        # them — so their label is the session title carried in prompt_text.
+        # Without this fallback every Claude Code row renders blank.
         prompt = getattr(run, "prompt", "") or ""
+        # Which field we used decides how to clip it, and only the caller
+        # knows. Sniffing for a "/" gets it wrong: titles routinely quote a
+        # path ("Fix a scoring bug in /Users/…/autojob") and would then be
+        # clipped from the front, keeping the repo name and losing the verb.
+        is_path = bool(prompt)
+        if not is_path:
+            prompt = getattr(run, "prompt_text", "") or ""
 
         # Truncate model and prompt to fit together
         # Available: width - (marker + age + padding + model padding) 
@@ -116,7 +140,10 @@ def render_list(
         prompt_budget = remaining - len(model_str) - 1  # -1 for separator space
         if prompt_budget < 1:
             prompt_budget = 1
-        prompt_trunc = _truncate_path(prompt, prompt_budget)
+        if is_path:
+            prompt_trunc = _truncate_path(prompt, prompt_budget)
+        else:
+            prompt_trunc = _truncate_title(prompt, prompt_budget)
 
         live_tag = " live" if run.live else ""
         row = f"{marker} {age}{live_tag} {model_str} {prompt_trunc}"
@@ -243,6 +270,14 @@ def main():
         "--once", action="store_true",
         help="Render one frame to stdout and exit (no curses)"
     )
+    parser.add_argument(
+        "--no-subagents", action="store_true",
+        help="Show only delegate.sh runs, not Claude Code subagents"
+    )
+    parser.add_argument(
+        "--subagent-limit", type=int, default=25,
+        help="How many recent subagent conversations to include (default 25)"
+    )
     args = parser.parse_args()
 
     try:
@@ -252,6 +287,19 @@ def main():
             return []
 
     runs = load_runs(ledger_path=args.ledger_path)
+
+    # Two kinds of agent-to-agent conversation, one list. The ledger covers
+    # work handed out by delegate.sh; subagents covers the ones Claude Code
+    # spawns itself, which never touch the ledger. Either source failing
+    # should cost you that half, not the whole screen.
+    if not args.no_subagents:
+        try:
+            from delegate_view.subagents import load_subagent_runs
+            runs = runs + load_subagent_runs(limit=args.subagent_limit)
+        except Exception:
+            pass
+
+    runs.sort(key=lambda r: r.started, reverse=True)
 
     if args.once:
         _render_once(runs, 80, 24, int(time.time() * 1000))
@@ -321,7 +369,9 @@ def main():
                     view = "list"
                     continue
 
-                convo_title = getattr(run_obj, "prompt", "") or "Conversation"
+                convo_title = (getattr(run_obj, "prompt", "")
+                               or getattr(run_obj, "prompt_text", "")
+                               or "Conversation")
                 convo_lines: list[str] | None = None
                 load_session = None
 
