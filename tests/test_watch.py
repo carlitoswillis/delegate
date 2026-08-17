@@ -635,5 +635,142 @@ class TestConversationCacheRateLimit(unittest.TestCase):
                              "Rate limit should prevent immediate reload")
 
 
+# ── Selection marker tests ──────────────────────────────────────────────
+
+
+class TestSelectionMarkerDiffers(unittest.TestCase):
+    """render_list output DIFFERS between selected=0 and selected=1."""
+
+    def test_different_selected_produces_different_output(self):
+        runs = [
+            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
+            for i in range(5)
+        ]
+        out0 = render_list(runs, 0, 80, 10, NOW)
+        out1 = render_list(runs, 1, 80, 10, NOW)
+        self.assertNotEqual(out0, out1,
+                            "render_list should differ between selected=0 and selected=1")
+
+
+class TestSelectionMarkerOnCorrectRow(unittest.TestCase):
+    """The selected row carries '>' and non-selected rows carry ' '."""
+
+    def test_selected_row_has_gutter(self):
+        runs = [
+            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
+            for i in range(5)
+        ]
+        out = render_list(runs, 2, 80, 10, NOW)
+        # Lines 2-6 are the run rows (0=header, 1=separator)
+        run_rows = out[2:7]
+        self.assertTrue(run_rows[2].startswith(">"),
+                        f"Selected row should start with >, got {run_rows[2]!r}")
+        for i, row in enumerate(run_rows):
+            if i != 2:
+                self.assertTrue(row.startswith(" "),
+                                f"Non-selected row {i} should start with space, got {row!r}")
+
+    def test_only_one_selected_row(self):
+        runs = [
+            FakeRun(started=NOW, prompt=f"/t/task{i}.md", model="m")
+            for i in range(5)
+        ]
+        out = render_list(runs, 3, 80, 10, NOW)
+        run_rows = out[2:7]
+        gutter_count = sum(1 for r in run_rows if r.startswith(">"))
+        self.assertEqual(gutter_count, 1,
+                         f"Exactly one row should be selected, found {gutter_count}")
+
+
+class TestSelectionMarkerAfterScroll(unittest.TestCase):
+    """Selection marker is correct when selected is near the end and list has
+    scrolled."""
+
+    def test_scrolled_selection_marker(self):
+        # 20 runs, height=8 → view_height=5, so selected=18 should scroll
+        runs = [
+            FakeRun(started=NOW - i * 60000, prompt=f"f{i}.py", model="m")
+            for i in range(20)
+        ]
+        out = render_list(runs, 18, 80, 8, NOW)
+        # Run rows are at indices 2..6 (view_height=5)
+        run_rows = out[2:7]
+        # The selected run is f18.py; find which screen row has it
+        marked_idx = None
+        for i, row in enumerate(run_rows):
+            if row.startswith(">"):
+                marked_idx = i
+                self.assertIn("f18", row,
+                              f"Marked row should contain f18, got {row!r}")
+                break
+        self.assertIsNotNone(marked_idx, "No marked row found after scroll")
+
+
+class TestSelectionMarkerWidthGuarantee(unittest.TestCase):
+    """Width guarantee holds with the gutter for various widths."""
+
+    def _check_width(self, width):
+        run = FakeRun(
+            started=NOW, prompt="/very/long/path/to/some/file.py",
+            model="anthropic/claude-opus-4-20250918-extra-long"
+        )
+        out = render_list([run], 0, width, 10, NOW)
+        for ln in out:
+            self.assertLessEqual(len(ln), width,
+                                 f"Line too long at width={width}: {ln!r}")
+
+    def test_width_20(self):
+        self._check_width(20)
+
+    def test_width_40(self):
+        self._check_width(40)
+
+    def test_width_80(self):
+        self._check_width(80)
+
+    def test_width_200(self):
+        self._check_width(200)
+
+    def test_width_30(self):
+        self._check_width(30)
+
+
+class TestSelectedFinishedRunMarked(unittest.TestCase):
+    """A selected FINISHED run is visibly marked."""
+
+    def test_finished_selected_has_gutter(self):
+        run = FakeRun(started=NOW, prompt="done.py", model="m", live=False)
+        out = render_list([run], 0, 80, 10, NOW)
+        run_rows = out[2:3]  # single run
+        self.assertTrue(run_rows[0].startswith(">"),
+                        f"Selected finished run should start with >, got {run_rows[0]!r}")
+        self.assertIn("\u00b7", run_rows[0],
+                      "Finished run should still have the · marker")
+
+
+class TestLiveAndSelectedDistinguishable(unittest.TestCase):
+    """A live run and a selected run are distinguishable when different rows."""
+
+    def test_live_unselected_vs_finished_selected(self):
+        r_live = FakeRun(started=NOW, prompt="live.py", model="m", live=True)
+        r_done = FakeRun(started=NOW, prompt="done.py", model="m", live=False)
+        out = render_list([r_live, r_done], 1, 80, 10, NOW)
+        run_rows = out[2:4]
+        # Row 0: live, unselected → "  ● ...live"
+        self.assertTrue(run_rows[0].startswith(" "),
+                        "Live unselected should start with space")
+        self.assertIn("\u25cf", run_rows[0],
+                      "Live run should have ● marker")
+        self.assertIn("live", run_rows[0],
+                      "Live run should have 'live' tag")
+        # Row 1: finished, selected → "> · ...done"
+        self.assertTrue(run_rows[1].startswith(">"),
+                        "Selected finished should start with >")
+        self.assertIn("\u00b7", run_rows[1],
+                      "Finished run should have · marker")
+        self.assertNotIn("live", run_rows[1],
+                         "Finished run should not have 'live' tag")
+
+
 if __name__ == "__main__":
     unittest.main()

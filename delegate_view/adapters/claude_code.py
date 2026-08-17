@@ -153,17 +153,46 @@ def _peek(path: Path) -> dict:
 
 
 def list_sessions(db_path: Path | None = None,
-                  cwd: str | None = None) -> list[Session]:
+                  cwd: str | None = None, *,
+                  limit: int | None = None,
+                  subagents_only: bool = False) -> list[Session]:
     root = db_path or default_db_path()
     if not root.exists():
         return []
 
-    out: list[Session] = []
-    for path in _iter_files(root):
+    # 1. Glob every transcript path (cheap — ~0.02s for 4000+ files).
+    candidates = list(_iter_files(root))
+
+    # 2. Filter by path shape BEFORE opening any file. Subagent transcripts
+    #    live under  <project>/<parent-uuid>/subagents/...  — detected by
+    #    _parent_of() which only inspects path components, not file contents.
+    if subagents_only:
+        candidates = [p for p in candidates if _parent_of(p, root) is not None]
+
+    # 3. Stat each remaining candidate — cheap (~0.01s).
+    stat_map: dict[Path, object] = {}
+    for path in candidates:
         try:
-            stat = path.stat()
+            stat_map[path] = path.stat()
         except OSError:
             continue
+
+    # 4. Sort by mtime descending (same value as `updated`).
+    sorted_paths = sorted(
+        stat_map.keys(), key=lambda p: stat_map[p].st_mtime, reverse=True,
+    )
+
+    # 5. If a limit is requested and cwd filtering is NOT needed, we can
+    #    safely cap the peek set.  When cwd IS given, cwd filtering requires
+    #    reading file contents, so we must peek broadly — the limit is applied
+    #    after peeking and filtering.
+    if limit is not None and cwd is None:
+        sorted_paths = sorted_paths[:limit]
+
+    # 6. Peek ONLY the files we actually need to display.
+    out: list[Session] = []
+    for path in sorted_paths:
+        stat = stat_map[path]
         meta = _peek(path)
         if cwd is not None and meta["cwd"] != cwd:
             continue
@@ -182,7 +211,11 @@ def list_sessions(db_path: Path | None = None,
             created=meta["created"] or int(stat.st_mtime * 1000),
             updated=int(stat.st_mtime * 1000),
         ))
-    out.sort(key=lambda s: s.updated, reverse=True)
+
+    if cwd is not None:
+        out.sort(key=lambda s: s.updated, reverse=True)
+        if limit is not None:
+            out = out[:limit]
     return out
 
 

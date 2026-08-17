@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import time
 
-from delegate_view.adapters import list_sessions
+from delegate_view.adapters.claude_code import list_sessions as _cc_list_sessions
 from delegate_view.runs import Run, LIVE_WINDOW_S
 
 
 def load_subagent_runs(limit: int = 50, since_ms: int | None = None) -> list[Run]:
     """Recent Claude Code subagent conversations, as Run objects, newest first."""
     try:
-        sessions = list_sessions(platform="claude-code")
+        sessions = _cc_list_sessions(subagents_only=True, limit=limit)
     except Exception:
         return []
 

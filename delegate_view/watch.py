@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import sys
 import threading
 import time
 import textwrap
@@ -245,6 +246,8 @@ def render_list(
 
     for i, run in enumerate(visible):
         idx = scroll + i
+        is_selected = (idx == selected)
+        gutter = ">" if is_selected else " "
         marker = "\u25cf" if run.live else "\u00b7"
         age = _relative_age(now, run.started)
         model = getattr(run, "model", "") or ""
@@ -254,10 +257,11 @@ def render_list(
             prompt = getattr(run, "prompt_text", "") or ""
 
         # Truncate model and prompt to fit together
-        fixed = len(marker) + 1 + len(age) + 1
+        # gutter(1) + space(1) + marker(1) + space(1) + age + space(1)
+        fixed = 1 + 1 + len(marker) + 1 + len(age) + 1
         remaining = width - fixed
         if remaining < 10:
-            row = (f"{marker} {age}").ljust(width)[:width]
+            row = (f"{gutter} {marker} {age}").ljust(width)[:width]
             lines.append(row)
             continue
 
@@ -275,7 +279,7 @@ def render_list(
             prompt_trunc = _truncate_title(prompt, prompt_budget)
 
         live_tag = " live" if run.live else ""
-        row = f"{marker} {age}{live_tag} {model_str} {prompt_trunc}"
+        row = f"{gutter} {marker} {age}{live_tag} {model_str} {prompt_trunc}"
         lines.append(row.ljust(width)[:width])
 
     # Pad to view_height
@@ -446,11 +450,24 @@ def main():
         def load_runs(ledger_path=None):
             return []
 
-    runs = load_runs(ledger_path=args.ledger_path, resolve=not args.once)
+    runs = []  # start empty so TUI opens immediately
+    runs_lock = threading.Lock()
+
+    def _load_runs_bg():
+        nonlocal runs
+        try:
+            fresh = load_runs(ledger_path=args.ledger_path, resolve=True)
+            with runs_lock:
+                runs.extend(fresh)
+                runs.sort(key=lambda r: r.started, reverse=True)
+        except Exception:
+            pass
+
+    load_thread = threading.Thread(target=_load_runs_bg, daemon=True)
+    load_thread.start()
 
     subagent_status = ""  # shown in header while loading
     subagent_done = threading.Event()
-    runs_lock = threading.Lock()
 
     # Two kinds of agent-to-agent conversation, one list. The ledger covers
     # work handed out by delegate.sh; subagents covers the ones Claude Code
@@ -491,7 +508,8 @@ def main():
         nonlocal subagent_status
 
         curses.curs_set(0)
-        stdscr.timeout(1000)
+        curses.set_escdelay(25)
+        stdscr.timeout(20)
 
         if curses.has_colors():
             curses.start_color()
@@ -501,12 +519,18 @@ def main():
         # Enable mouse events
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            # Enable xterm mouse protocol for terminals that need it
+            sys.stdout.write("\033[?1003h")
+            sys.stdout.flush()
         except Exception:
             pass
 
         sel = 0
         view = "list"
         scroll = 0
+        last_action = "noop"
+        last_key_time = 0
+        repeat_delay_ms = 250
         convo_cache = ConversationCache()
         cached_convo_lines: list[str] = []
         cached_convo_title: str = ""
@@ -529,48 +553,54 @@ def main():
             now_ms = int(time.time() * 1000)
 
             if view == "list":
-                stdscr.erase()
-                with runs_lock:
-                    runs_snapshot = list(runs)
-                text = render_list(runs_snapshot, sel, w, h, now_ms,
-                                   header=subagent_status)
-                for i, ln in enumerate(text):
-                    try:
-                        if i < h and 0 <= i < h - 1:
-                            run_obj = (runs_snapshot[sel]
-                                       if sel < len(runs_snapshot) else None)
-                            attr = curses.color_pair(1) if (
-                                run_obj and run_obj.live and i == sel + 2
-                            ) else 0
-                            stdscr.addnstr(i, 0, ln, w, attr)
-                    except curses.error:
-                        pass
-                stdscr.refresh()
-
                 key = stdscr.getch()
                 if key == -1:
-                    # Idle tick: only check for live-run list updates if
-                    # there are live runs in the snapshot.
-                    if any(r.live for r in runs_snapshot):
-                        pass  # just re-render on next loop iteration
+                    if last_action in ("up", "down") and now_ms - last_key_time >= repeat_delay_ms:
+                        if last_action == "up":
+                            sel = max(0, sel - 1)
+                        else:
+                            n = len(runs_snapshot)
+                            sel = min(n - 1, sel + 1) if n else 0
+                        stdscr.erase()
+                        with runs_lock:
+                            runs_snapshot = list(runs)
+                        now_ms = int(time.time() * 1000)
+                        text = render_list(runs_snapshot, sel, w, h, now_ms,
+                                           header=subagent_status)
+                        for i, ln in enumerate(text):
+                            try:
+                                if i < h and 0 <= i < h - 1:
+                                    stdscr.addnstr(i, 0, ln, w, 0)
+                            except curses.error:
+                                pass
+                        stdscr.refresh()
                     continue
 
+                with runs_lock:
+                    runs_snapshot = list(runs)
                 action = resolve_key_action(key, "list")
                 if action == "quit":
                     break
                 elif action == "up":
                     sel = max(0, sel - 1)
+                    last_action = "up"
+                    last_key_time = now_ms
                 elif action == "down":
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + 1) if n else 0
+                    last_action = "down"
+                    last_key_time = now_ms
                 elif action == "top":
                     sel = 0
+                    last_action = "noop"
                 elif action == "bottom":
                     sel = len(runs_snapshot) - 1 if runs_snapshot else 0
+                    last_action = "noop"
                 elif action == "select":
                     if runs_snapshot and 0 <= sel < len(runs_snapshot):
                         view = "convo"
                         scroll = 0
+                        last_action = "noop"
                         run_obj = runs_snapshot[sel]
                         cached_convo_lines = _load_and_cache_convo(run_obj)
                         cached_convo_title = (
@@ -582,31 +612,47 @@ def main():
                     page = max(1, h - 3)
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + page) if n else 0
+                    last_action = "noop"
                 elif action == "page_up":
                     page = max(1, h - 3)
                     sel = max(0, sel - page)
+                    last_action = "noop"
                 elif action == "half_page_down":
                     half = max(1, (h - 3) // 2)
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + half) if n else 0
+                    last_action = "noop"
                 elif action == "half_page_up":
                     half = max(1, (h - 3) // 2)
                     sel = max(0, sel - half)
+                    last_action = "noop"
                 elif action == "mouse":
                     try:
                         _, mx, my, _, bstate = curses.getmouse()
                     except Exception:
                         continue
                     if bstate & curses.BUTTON4_PRESSED:
-                        # wheel up
                         sel = max(0, sel - 3)
                     elif bstate & curses.BUTTON5_PRESSED:
-                        # wheel down
                         n = len(runs_snapshot)
                         sel = min(n - 1, sel + 3) if n else 0
+                    last_action = "noop"
+                else:
+                    last_action = "noop"
+
+                stdscr.erase()
+                now_ms = int(time.time() * 1000)
+                text = render_list(runs_snapshot, sel, w, h, now_ms,
+                                   header=subagent_status)
+                for i, ln in enumerate(text):
+                    try:
+                        if i < h and 0 <= i < h - 1:
+                            stdscr.addnstr(i, 0, ln, w, 0)
+                    except curses.error:
+                        pass
+                stdscr.refresh()
 
             elif view == "convo":
-                # Re-render cached conversation; only reload if cache is stale
                 with runs_lock:
                     runs_snapshot = list(runs)
                 run_obj = (runs_snapshot[sel]
@@ -615,6 +661,95 @@ def main():
                     view = "list"
                     continue
 
+                convo_lines = cached_convo_lines
+
+                key = stdscr.getch()
+                if key == -1:
+                    if last_action in ("scroll_up", "scroll_down") and now_ms - last_key_time >= repeat_delay_ms:
+                        max_scroll = max(0, len(convo_lines) - (h - 3))
+                        if last_action == "scroll_up":
+                            scroll = max(0, scroll - 1)
+                        else:
+                            scroll = min(max_scroll, scroll + 1)
+                    elif not (run_obj.live and convo_cache.needs_reload(run_obj)):
+                        continue
+
+                    if run_obj.live and convo_cache.needs_reload(run_obj):
+                        cached_convo_lines = _load_and_cache_convo(run_obj)
+                        cached_convo_title = (
+                            getattr(run_obj, "prompt", "")
+                            or getattr(run_obj, "prompt_text", "")
+                            or "Conversation"
+                        )
+                        convo_lines = cached_convo_lines
+
+                    if run_obj.live and scroll >= len(convo_lines) - (h - 3) - 1:
+                        scroll = max(0, len(convo_lines) - (h - 3))
+
+                    stdscr.erase()
+                    text = render_convo(
+                        cached_convo_title, convo_lines, scroll, w, h
+                    )
+                    for i, ln in enumerate(text):
+                        try:
+                            if i < h and 0 <= i < h - 1:
+                                stdscr.addnstr(i, 0, ln, w, 0)
+                        except curses.error:
+                            pass
+                    stdscr.refresh()
+                    continue
+
+                if key == curses.KEY_MOUSE:
+                    try:
+                        _, mx, my, _, bstate = curses.getmouse()
+                    except Exception:
+                        continue
+                    max_scroll = max(0, len(convo_lines) - (h - 3))
+                    if bstate & curses.BUTTON4_PRESSED:
+                        scroll = max(0, scroll - 3)
+                    elif bstate & curses.BUTTON5_PRESSED:
+                        scroll = min(max_scroll, scroll + 3)
+                    last_action = "noop"
+                else:
+                    action = resolve_key_action(key, "convo")
+                    max_scroll = max(0, len(convo_lines) - (h - 3))
+                    if action == "back":
+                        view = "list"
+                        scroll = 0
+                        last_action = "noop"
+                    elif action == "scroll_up":
+                        scroll = max(0, scroll - 1)
+                        last_action = "scroll_up"
+                        last_key_time = now_ms
+                    elif action == "scroll_down":
+                        scroll = min(max_scroll, scroll + 1)
+                        last_action = "scroll_down"
+                        last_key_time = now_ms
+                    elif action == "scroll_top":
+                        scroll = 0
+                        last_action = "noop"
+                    elif action == "scroll_bottom":
+                        scroll = max_scroll
+                        last_action = "noop"
+                    elif action == "page_down":
+                        page = max(1, h - 3)
+                        scroll = min(max_scroll, scroll + page)
+                        last_action = "noop"
+                    elif action == "page_up":
+                        page = max(1, h - 3)
+                        scroll = max(0, scroll - page)
+                        last_action = "noop"
+                    elif action == "half_page_down":
+                        half = max(1, (h - 3) // 2)
+                        scroll = min(max_scroll, scroll + half)
+                        last_action = "noop"
+                    elif action == "half_page_up":
+                        half = max(1, (h - 3) // 2)
+                        scroll = max(0, scroll - half)
+                        last_action = "noop"
+                    else:
+                        last_action = "noop"
+
                 if convo_cache.needs_reload(run_obj):
                     cached_convo_lines = _load_and_cache_convo(run_obj)
                     cached_convo_title = (
@@ -622,10 +757,9 @@ def main():
                         or getattr(run_obj, "prompt_text", "")
                         or "Conversation"
                     )
+                    convo_lines = cached_convo_lines
 
                 convo_lines = cached_convo_lines
-
-                # Auto-follow live runs
                 if run_obj.live and scroll >= len(convo_lines) - (h - 3) - 1:
                     scroll = max(0, len(convo_lines) - (h - 3))
 
@@ -641,60 +775,19 @@ def main():
                         pass
                 stdscr.refresh()
 
-                key = stdscr.getch()
-                if key == -1:
-                    # Idle tick: only reload if live run changed
-                    if run_obj.live and convo_cache.needs_reload(run_obj):
-                        cached_convo_lines = _load_and_cache_convo(run_obj)
-                        cached_convo_title = (
-                            getattr(run_obj, "prompt", "")
-                            or getattr(run_obj, "prompt_text", "")
-                            or "Conversation"
-                        )
-                    continue
-
-                if key == curses.KEY_MOUSE:
-                    try:
-                        _, mx, my, _, bstate = curses.getmouse()
-                    except Exception:
-                        continue
-                    max_scroll = max(0, len(convo_lines) - (h - 3))
-                    if bstate & curses.BUTTON4_PRESSED:
-                        scroll = max(0, scroll - 3)
-                    elif bstate & curses.BUTTON5_PRESSED:
-                        scroll = min(max_scroll, scroll + 3)
-                    continue
-
-                action = resolve_key_action(key, "convo")
-                max_scroll = max(0, len(convo_lines) - (h - 3))
-                if action == "back":
-                    view = "list"
-                    scroll = 0
-                elif action == "scroll_up":
-                    scroll = max(0, scroll - 1)
-                elif action == "scroll_down":
-                    scroll = min(max_scroll, scroll + 1)
-                elif action == "scroll_top":
-                    scroll = 0
-                elif action == "scroll_bottom":
-                    scroll = max_scroll
-                elif action == "page_down":
-                    page = max(1, h - 3)
-                    scroll = min(max_scroll, scroll + page)
-                elif action == "page_up":
-                    page = max(1, h - 3)
-                    scroll = max(0, scroll - page)
-                elif action == "half_page_down":
-                    half = max(1, (h - 3) // 2)
-                    scroll = min(max_scroll, scroll + half)
-                elif action == "half_page_up":
-                    half = max(1, (h - 3) // 2)
-                    scroll = max(0, scroll - half)
-
     try:
         curses.wrapper(_curses_main)
+    except KeyboardInterrupt:
+        pass
     except Exception:
         pass
+    finally:
+        # Restore terminal: disable xterm mouse reporting
+        try:
+            sys.stdout.write("\033[?1003l")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
