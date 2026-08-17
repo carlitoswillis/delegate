@@ -32,7 +32,7 @@ def load_subagent_runs(limit: int = 50, since_ms: int | None = None) -> list[Run
         out.append(Run(
             started=started,
             prompt="",
-            transcript="",
+            transcript=s.path,
             model=s.model,
             cwd=s.cwd,
             continued=False,

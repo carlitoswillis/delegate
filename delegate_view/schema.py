@@ -60,6 +60,11 @@ class Session:
     Code marks the same idea with sidechain entries. Normalizing both to a
     parent pointer lets the viewer nest them instead of showing a stray
     conversation with no visible cause.
+
+    path is the liveness signal: mtime on that file is how the viewer knows
+    a conversation is still being written.  Left empty for platforms where a
+    session is not one file (opencode keeps sessions in a shared SQLite DB,
+    so an mtime there tells you only that *something* changed).
     """
 
     id: str
@@ -74,4 +79,5 @@ class Session:
     cost: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
+    path: str = ""  # transcript file backing this session, when it is a file
     events: list[Event] = field(default_factory=list)
