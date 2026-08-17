@@ -529,6 +529,7 @@ def main():
         view = "list"
         scroll = 0
         last_action = "noop"
+        last_key = -1
         last_key_time = 0
         repeat_delay_ms = 250
         convo_cache = ConversationCache()
@@ -554,6 +555,8 @@ def main():
 
             if view == "list":
                 key = stdscr.getch()
+                if key != -1 and key == last_key and now_ms - last_key_time < repeat_delay_ms:
+                    key = -1  # debounce: treat rapid same-key as no input
                 if key == -1:
                     if last_action in ("up", "down") and now_ms - last_key_time >= repeat_delay_ms:
                         if last_action == "up":
@@ -584,23 +587,28 @@ def main():
                 elif action == "up":
                     sel = max(0, sel - 1)
                     last_action = "up"
+                    last_key = key
                     last_key_time = now_ms
                 elif action == "down":
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + 1) if n else 0
                     last_action = "down"
+                    last_key = key
                     last_key_time = now_ms
                 elif action == "top":
                     sel = 0
                     last_action = "noop"
+                    last_key = -1
                 elif action == "bottom":
                     sel = len(runs_snapshot) - 1 if runs_snapshot else 0
                     last_action = "noop"
+                    last_key = -1
                 elif action == "select":
                     if runs_snapshot and 0 <= sel < len(runs_snapshot):
                         view = "convo"
                         scroll = 0
                         last_action = "noop"
+                        last_key = -1
                         run_obj = runs_snapshot[sel]
                         cached_convo_lines = _load_and_cache_convo(run_obj)
                         cached_convo_title = (
@@ -613,19 +621,23 @@ def main():
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + page) if n else 0
                     last_action = "noop"
+                    last_key = -1
                 elif action == "page_up":
                     page = max(1, h - 3)
                     sel = max(0, sel - page)
                     last_action = "noop"
+                    last_key = -1
                 elif action == "half_page_down":
                     half = max(1, (h - 3) // 2)
                     n = len(runs_snapshot)
                     sel = min(n - 1, sel + half) if n else 0
                     last_action = "noop"
+                    last_key = -1
                 elif action == "half_page_up":
                     half = max(1, (h - 3) // 2)
                     sel = max(0, sel - half)
                     last_action = "noop"
+                    last_key = -1
                 elif action == "mouse":
                     try:
                         _, mx, my, _, bstate = curses.getmouse()
@@ -637,8 +649,10 @@ def main():
                         n = len(runs_snapshot)
                         sel = min(n - 1, sel + 3) if n else 0
                     last_action = "noop"
+                    last_key = -1
                 else:
                     last_action = "noop"
+                    last_key = -1
 
                 stdscr.erase()
                 now_ms = int(time.time() * 1000)
@@ -710,45 +724,57 @@ def main():
                     elif bstate & curses.BUTTON5_PRESSED:
                         scroll = min(max_scroll, scroll + 3)
                     last_action = "noop"
+                    last_key = -1
+                    continue
+
+                action = resolve_key_action(key, "convo")
+                max_scroll = max(0, len(convo_lines) - (h - 3))
+                if action == "back":
+                    view = "list"
+                    scroll = 0
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "scroll_up":
+                    scroll = max(0, scroll - 1)
+                    last_action = "scroll_up"
+                    last_key = key
+                    last_key_time = now_ms
+                elif action == "scroll_down":
+                    scroll = min(max_scroll, scroll + 1)
+                    last_action = "scroll_down"
+                    last_key = key
+                    last_key_time = now_ms
+                elif action == "scroll_top":
+                    scroll = 0
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "scroll_bottom":
+                    scroll = max_scroll
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "page_down":
+                    page = max(1, h - 3)
+                    scroll = min(max_scroll, scroll + page)
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "page_up":
+                    page = max(1, h - 3)
+                    scroll = max(0, scroll - page)
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "half_page_down":
+                    half = max(1, (h - 3) // 2)
+                    scroll = min(max_scroll, scroll + half)
+                    last_action = "noop"
+                    last_key = -1
+                elif action == "half_page_up":
+                    half = max(1, (h - 3) // 2)
+                    scroll = max(0, scroll - half)
+                    last_action = "noop"
+                    last_key = -1
                 else:
-                    action = resolve_key_action(key, "convo")
-                    max_scroll = max(0, len(convo_lines) - (h - 3))
-                    if action == "back":
-                        view = "list"
-                        scroll = 0
-                        last_action = "noop"
-                    elif action == "scroll_up":
-                        scroll = max(0, scroll - 1)
-                        last_action = "scroll_up"
-                        last_key_time = now_ms
-                    elif action == "scroll_down":
-                        scroll = min(max_scroll, scroll + 1)
-                        last_action = "scroll_down"
-                        last_key_time = now_ms
-                    elif action == "scroll_top":
-                        scroll = 0
-                        last_action = "noop"
-                    elif action == "scroll_bottom":
-                        scroll = max_scroll
-                        last_action = "noop"
-                    elif action == "page_down":
-                        page = max(1, h - 3)
-                        scroll = min(max_scroll, scroll + page)
-                        last_action = "noop"
-                    elif action == "page_up":
-                        page = max(1, h - 3)
-                        scroll = max(0, scroll - page)
-                        last_action = "noop"
-                    elif action == "half_page_down":
-                        half = max(1, (h - 3) // 2)
-                        scroll = min(max_scroll, scroll + half)
-                        last_action = "noop"
-                    elif action == "half_page_up":
-                        half = max(1, (h - 3) // 2)
-                        scroll = max(0, scroll - half)
-                        last_action = "noop"
-                    else:
-                        last_action = "noop"
+                    last_action = "noop"
+                    last_key = -1
 
                 if convo_cache.needs_reload(run_obj):
                     cached_convo_lines = _load_and_cache_convo(run_obj)
