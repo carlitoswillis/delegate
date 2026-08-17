@@ -28,9 +28,39 @@ PROMPT="${1:?usage: delegate.sh [-c] <prompt-file> [transcript-file]}"
 LOG="${2:-${PROMPT%.*}-transcript.log}"
 MODEL="${DELEGATE_MODEL:-opencode/big-pickle}"
 
+# THE LEDGER: one JSON line per run, appended before the run starts.
+#
+# Without this there is no record that a delegation happened at all — the
+# opencode session lands in a SQLite row keyed by working directory, and
+# matching it back to the task you handed over means eyeballing timestamps.
+# `started` is what lets a viewer resolve the session afterwards: the run is
+# the newest session in `cwd` created at or after that moment.
+#
+# Written BEFORE the run for the same reason the prompt is appended before
+# the reply — if the run dies, the record of what was asked survives.
+LEDGER="${DELEGATE_LEDGER:-$HOME/.delegate/runs.jsonl}"
+mkdir -p "$(dirname "$LEDGER")"
+
+# python3 does the quoting; hand-rolled JSON breaks on the first quote or
+# backslash in a path, and paths here are user-controlled.
+python3 - "$PROMPT" "$LOG" "$MODEL" "$PWD" "${CONT:-new}" >> "$LEDGER" <<'PY'
+import json, os, sys, time
+prompt, log, model, cwd, cont = sys.argv[1:6]
+print(json.dumps({
+    "started": int(time.time() * 1000),
+    "prompt": os.path.abspath(prompt),
+    "transcript": os.path.abspath(log),
+    "model": model,
+    "cwd": cwd,
+    "continued": cont == "-c",
+    "pid": os.getppid(),
+}))
+PY
+
 { printf '\n===== SENT %s — %s =====\n\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$MODEL"
   cat "$PROMPT"
   printf '\n===== REPLY =====\n\n'; } >> "$LOG"
 
 echo "transcript: $LOG" >&2
+echo "ledger:     $LEDGER" >&2
 opencode run ${CONT:+$CONT} -m "$MODEL" --auto "$(cat "$PROMPT")" >> "$LOG" 2>&1
