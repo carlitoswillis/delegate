@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# delegate — hand work to another agent, and watch the conversation.
+#
+#   delegate run task.md          hand task.md to another model
+#   delegate run -c followup.md   continue the last session
+#   delegate watch                live view of agent conversations
+#   delegate ls                   list recent runs
+#   delegate install              symlink this onto your PATH
+#
+# This is the global entrypoint. It resolves its own repo location so the
+# symlink in ~/.local/bin keeps working no matter where you run it from —
+# the whole point of a global command is that `cd` stops mattering, and the
+# session-scoping surprises in the underlying tools are enough of that
+# already.
+set -euo pipefail
+
+# Resolve through symlinks to the real repo, without requiring GNU readlink.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$DIR/$SELF"
+done
+ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
+
+usage() { sed -n '3,10p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+CMD="${1:-}"; shift || true
+
+case "$CMD" in
+  run)
+    exec "$ROOT/delegate.sh" "$@"
+    ;;
+  watch)
+    # PYTHONPATH so the module is importable without an install step.
+    exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m delegate_view.watch "$@"
+    ;;
+  ls)
+    exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$@" <<'PY'
+import datetime, sys
+from delegate_view.runs import load_runs
+
+runs = load_runs()
+if not runs:
+    print("no agent runs yet — try: delegate run task.md")
+    sys.exit(0)
+for r in runs:
+    when = datetime.datetime.fromtimestamp(r.started / 1000).strftime("%m-%d %H:%M")
+    mark = "● live" if r.live else "·     "
+    name = r.prompt.rsplit("/", 1)[-1]
+    print(f"{mark}  {when}  {r.model:<24} {name:<28} {r.size:>8}B")
+PY
+    ;;
+  install)
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$ROOT/bin/delegate" "$HOME/.local/bin/delegate"
+    echo "linked $HOME/.local/bin/delegate -> $ROOT/bin/delegate"
+    case ":$PATH:" in
+      *":$HOME/.local/bin:"*) echo "~/.local/bin is on your PATH — run: delegate ls" ;;
+      *) echo "WARNING: ~/.local/bin is not on your PATH; add it to your shell rc" ;;
+    esac
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    echo "delegate: unknown command '$CMD'" >&2
+    echo >&2
+    usage >&2
+    exit 2
+    ;;
+esac
