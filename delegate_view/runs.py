@@ -37,6 +37,9 @@ class Run:
     prompt_text: str = ""
     session_id: str = ""
     platform: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost: float = 0.0
     raw: dict = field(default_factory=dict)
 
 
@@ -81,26 +84,64 @@ def _prompt_head(path: str, limit: int = 200) -> str:
         return ""
 
 
+def _apply_session_to_run(run: Run, sessions: list) -> tuple[str, str]:
+    """Pick the best session from a pre-fetched list and populate run stats.
+
+    Among sessions whose ``created`` is truthy and ``>= run.started``, pick
+    the one with the smallest ``created``.  Returns (platform, session_id) or
+    ("", "") when nothing matches.
+
+    NOTE: two runs in the same cwd started seconds apart will both resolve to
+    the same earliest session.  Fixing that is out of scope here.
+    """
+    candidates = [s for s in sessions if s.created and s.created >= run.started]
+    if not candidates:
+        return "", ""
+    best = min(candidates, key=lambda s: s.created)
+    run.tokens_in = best.tokens_in
+    run.tokens_out = best.tokens_out
+    run.cost = best.cost
+    return best.platform, best.id
+
+
 def resolve_session(run: Run) -> tuple[str, str]:
     """(platform, session_id) for the session this run produced, else ("", "").
 
-    Picks the OLDEST session in the run's directory created at or after the
-    ledger timestamp. Newest-first would pick up a later, unrelated run in the
-    same directory — which is exactly what happens when you delegate twice.
+    Also populates run.tokens_in, run.tokens_out, run.cost from the session
+    when available (OpenCode populates these in list_sessions; Claude Code
+    does not).
     """
-    # Imported lazily: a broken adapter should degrade the session link, not
-    # stop the ledger from listing at all.
     try:
         from delegate_view import adapters
         sessions = adapters.list_sessions(cwd=run.cwd)
     except Exception:
         return "", ""
+    return _apply_session_to_run(run, sessions)
 
-    candidates = [s for s in sessions if s.created and s.created >= run.started]
-    if not candidates:
-        return "", ""
-    best = min(candidates, key=lambda s: s.created)
-    return best.platform, best.id
+
+def resolve_sessions(runs: list[Run]) -> None:
+    """Resolve all runs in one batch — one list_sessions call per distinct cwd.
+
+    Much faster than calling resolve_session per run: on a ledger with 13
+    runs across 3 cwds this issues 3 adapter queries instead of 13.
+    """
+    from collections import defaultdict
+    from delegate_view import adapters
+
+    by_cwd: dict[str, list[Run]] = defaultdict(list)
+    for r in runs:
+        by_cwd[r.cwd].append(r)
+
+    session_cache: dict[str, list] = {}
+    for cwd, cwd_runs in by_cwd.items():
+        try:
+            sessions = adapters.list_sessions(cwd=cwd)
+        except Exception:
+            sessions = []
+        session_cache[cwd] = sessions
+
+    for r in runs:
+        r.platform, r.session_id = _apply_session_to_run(r, session_cache[r.cwd])
 
 
 def load_runs(ledger_path: Path | None = None,
@@ -156,6 +197,5 @@ def load_runs(ledger_path: Path | None = None,
     runs.sort(key=lambda r: r.started, reverse=True)
 
     if resolve:
-        for r in runs:
-            r.platform, r.session_id = resolve_session(r)
+        resolve_sessions(runs)
     return runs

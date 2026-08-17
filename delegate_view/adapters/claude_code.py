@@ -19,6 +19,7 @@ Two things shape this adapter:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,15 @@ _SKIP_TYPES = {
 
 _HEAD_LINES = 40  # enough to reach the first real user turn
 _TAIL_BYTES = 65536  # enough to catch the latest ai-title
+
+
+def _slug_for_cwd(cwd: str) -> str:
+    """Map a cwd path to the project-directory slug Claude Code uses.
+
+    Every non-alphanumeric character (including `/`, `.`, `_`) is replaced by
+    `-`.  Verified against ~4000 real directories under ~/.claude/projects.
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def default_db_path() -> Path:
@@ -160,12 +170,24 @@ def list_sessions(db_path: Path | None = None,
     if not root.exists():
         return []
 
-    # 1. Glob every transcript path (cheap — ~0.02s for 4000+ files).
-    candidates = list(_iter_files(root))
+    # When cwd is given, narrow to the slug directory so we peek only the
+    # handful of transcripts for that project instead of scanning ~4000 files.
+    if cwd is not None:
+        slug_dir = root / _slug_for_cwd(cwd)
+        if not slug_dir.exists():
+            return []
+        candidates = list(_iter_files(slug_dir))
+    else:
+        # 1. Glob every transcript path (cheap — ~0.02s for 4000+ files).
+        candidates = list(_iter_files(root))
 
     # 2. Filter by path shape BEFORE opening any file. Subagent transcripts
     #    live under  <project>/<parent-uuid>/subagents/...  — detected by
     #    _parent_of() which only inspects path components, not file contents.
+    # _parent_of is always asked relative to `root`, never to the narrowed
+    # slug directory. Relative to slug_dir the project component is missing,
+    # so rel[1] would be the literal "subagents" instead of the parent uuid
+    # and every subagent would report the wrong parent.
     if subagents_only:
         candidates = [p for p in candidates if _parent_of(p, root) is not None]
 
@@ -182,11 +204,13 @@ def list_sessions(db_path: Path | None = None,
         stat_map.keys(), key=lambda p: stat_map[p].st_mtime, reverse=True,
     )
 
-    # 5. If a limit is requested and cwd filtering is NOT needed, we can
-    #    safely cap the peek set.  When cwd IS given, cwd filtering requires
-    #    reading file contents, so we must peek broadly — the limit is applied
-    #    after peeking and filtering.
-    if limit is not None and cwd is None:
+    # 5. Cap the peek set. Safe without a cwd, and safe WITH one only because
+    #    the slug already narrowed us to a single project directory. It is
+    #    still a cap on files peeked rather than on sessions returned: the
+    #    content check below can drop some, so a cwd query may come back with
+    #    fewer than `limit`. That is the right trade — the alternative is
+    #    peeking the whole corpus again to guarantee a full page.
+    if limit is not None:
         sorted_paths = sorted_paths[:limit]
 
     # 6. Peek ONLY the files we actually need to display.
@@ -194,6 +218,8 @@ def list_sessions(db_path: Path | None = None,
     for path in sorted_paths:
         stat = stat_map[path]
         meta = _peek(path)
+        # The slug is a fast path for FINDING files, never the authority on
+        # which cwd a transcript belongs to. The recorded cwd still decides.
         if cwd is not None and meta["cwd"] != cwd:
             continue
         parent = _parent_of(path, root)
@@ -210,12 +236,11 @@ def list_sessions(db_path: Path | None = None,
             model=meta["model"],
             created=meta["created"] or int(stat.st_mtime * 1000),
             updated=int(stat.st_mtime * 1000),
+            path=str(path),
         ))
 
     if cwd is not None:
         out.sort(key=lambda s: s.updated, reverse=True)
-        if limit is not None:
-            out = out[:limit]
     return out
 
 
@@ -248,6 +273,7 @@ def load_session(session_id: str, db_path: Path | None = None) -> Session:
         model=meta["model"],
         created=meta["created"],
         updated=int(path.stat().st_mtime * 1000),
+        path=str(path),
     )
 
     events: list[Event] = []

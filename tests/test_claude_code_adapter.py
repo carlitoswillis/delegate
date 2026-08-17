@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from delegate_view.adapters.claude_code import _peek, list_sessions
+from delegate_view.adapters.claude_code import _peek, _slug_for_cwd, list_sessions
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -281,9 +281,11 @@ class TestCwdFiltering(unittest.TestCase):
     def test_cwd_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            project = _make_project(root, "myproj")
-            _make_subagent(project, "p1", "a1", cwd="/proj/a")
-            _make_subagent(project, "p2", "a2", cwd="/proj/b")
+            # Place sessions in slug-narrowed directories so the slug path works.
+            proj_a = _make_project(root, _slug_for_cwd("/proj/a"))
+            proj_b = _make_project(root, _slug_for_cwd("/proj/b"))
+            _make_subagent(proj_a, "p1", "a1", cwd="/proj/a")
+            _make_subagent(proj_b, "p2", "a2", cwd="/proj/b")
 
             result = list_sessions(db_path=root, cwd="/proj/a")
             self.assertEqual(len(result), 1)
@@ -292,17 +294,99 @@ class TestCwdFiltering(unittest.TestCase):
     def test_cwd_with_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            project = _make_project(root, "myproj")
-            for i in range(5):
-                _make_subagent(project, f"p{i}", f"a{i}",
-                               cwd="/proj/a" if i % 2 == 0 else "/proj/b",
+            proj_a = _make_project(root, _slug_for_cwd("/proj/a"))
+            proj_b = _make_project(root, _slug_for_cwd("/proj/b"))
+            for i in range(3):
+                _make_subagent(proj_a, f"p{i}", f"a{i}",
+                               cwd="/proj/a",
                                ts=f"2026-08-16T10:{i:02d}:00.000Z")
                 time.sleep(0.01)
+            for i in range(2):
+                _make_subagent(proj_b, f"q{i}", f"b{i}",
+                               cwd="/proj/b",
+                               ts=f"2026-08-16T10:{3+i:02d}:00.000Z")
 
             result = list_sessions(db_path=root, cwd="/proj/a", limit=2)
             self.assertLessEqual(len(result), 2)
             for s in result:
                 self.assertEqual(s.cwd, "/proj/a")
+
+
+class TestSlugForCwd(unittest.TestCase):
+    """_slug_for_cwd matches the real Claude Code slug convention."""
+
+    def test_simple_path(self):
+        self.assertEqual(
+            _slug_for_cwd("/Users/carlitoswillis/workspace/AIA2ndBrain"),
+            "-Users-carlitoswillis-workspace-AIA2ndBrain",
+        )
+
+    def test_dotted_path(self):
+        self.assertEqual(
+            _slug_for_cwd("/Users/carlitoswillis/.claude/jobs/f235a2b9/tmp/exp"),
+            "-Users-carlitoswillis--claude-jobs-f235a2b9-tmp-exp",
+        )
+
+    def test_underscores_become_dash(self):
+        # Underscores are non-alphanumeric and become dashes.
+        self.assertEqual(_slug_for_cwd("/my_project"), "-my-project")
+
+
+class TestSlugNarrowsCandidates(unittest.TestCase):
+    """list_sessions(cwd=...) only peeks files in the slug directory."""
+
+    def test_only_matching_project_files_peeked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            slug_a = _slug_for_cwd("/proj/a")
+            slug_b = _slug_for_cwd("/proj/b")
+            proj_a = _make_project(root, slug_a)
+            proj_b = _make_project(root, slug_b)
+            _make_subagent(proj_a, "p1", "a1", cwd="/proj/a")
+            _make_subagent(proj_b, "p2", "a2", cwd="/proj/b")
+
+            peeked: list[Path] = []
+            original_peek = _peek
+
+            def tracking_peek(path):
+                peeked.append(path)
+                return original_peek(path)
+
+            from delegate_view.adapters import claude_code as cc_mod
+            old = cc_mod._peek
+            cc_mod._peek = tracking_peek
+            try:
+                result = list_sessions(db_path=root, cwd="/proj/a")
+            finally:
+                cc_mod._peek = old
+
+            # Only files from the matching slug directory were peeked.
+            for p in peeked:
+                self.assertIn(slug_a, str(p),
+                              f"Peeked file {p} is not in the slug-a directory")
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].cwd, "/proj/a")
+
+    def test_slug_dir_missing_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # No directory for _slug_for_cwd("/nonexistent") exists.
+            result = list_sessions(db_path=root, cwd="/nonexistent")
+            self.assertEqual(result, [])
+
+    def test_cwd_mismatch_excluded_by_content_check(self):
+        """A transcript in a slug directory but with a different cwd in its
+        content is excluded — the slug narrows, the content check decides."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            slug_a = _slug_for_cwd("/proj/a")
+            proj_a = _make_project(root, slug_a)
+            # File is in slug-a directory but records cwd="/proj/b" inside.
+            _make_subagent(proj_a, "p1", "a1", cwd="/proj/b")
+
+            result = list_sessions(db_path=root, cwd="/proj/a")
+            self.assertEqual(result, [],
+                             "Session with cwd mismatch should be excluded by content check")
 
 
 if __name__ == "__main__":
