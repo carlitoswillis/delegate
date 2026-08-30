@@ -2,38 +2,31 @@
 
 The TUI used to load runs once at launch and never again, which meant new
 delegations were invisible and live/frozen status was frozen too.  This
-module owns a background thread that re-reads the ledger and subagent list
-on a short interval and merges the results into a single list the TUI can
-cheaply snapshot every frame.
+module owns a background thread that re-reads the sources on a short interval
+and merges the results into a single list the TUI can cheaply snapshot every
+frame.
 
 Merging is the key design choice.  The TUI holds a reference to the selected
 Run and keys its conversation cache off it.  Replacing the entire list every
 2 seconds would invalidate that cache and re-read every open transcript from
 disk — turning a liveness feature into a performance bug.  Instead we
 identify each run by a stable key and update the existing object in place.
+
+What gets loaded is no longer this module's business.  sessions.all_runs()
+owns the source list and the de-duplication; the store owns refreshing,
+merging in place, and never letting either kill the thread.
 """
 
 from __future__ import annotations
 
-import os
 import threading
-import time
 from collections.abc import Callable
 
-from delegate_view.runs import LIVE_WINDOW_S, Run
+from delegate_view.runs import LIVE_WINDOW_S, Run, is_live, key_of  # noqa: F401
 
-
-def key_of(run: Run) -> tuple:
-    """Stable identity for a run across refreshes.
-
-    When a run has a resolved session we key on (platform, session_id); when
-    it does not (ledger-only, not yet resolved) we fall back to
-    (transcript, started).  Either way the key is hashable and unique enough
-    for the merge dictionary.
-    """
-    if run.platform and run.session_id:
-        return (run.platform, run.session_id)
-    return (run.transcript, run.started)
+# key_of and LIVE_WINDOW_S are re-exported: they moved to runs.py, next to the
+# Run they describe, but this is where the rest of the code already imports
+# them from and the identity rule is the same one either way.
 
 
 class RunStore:
@@ -54,6 +47,7 @@ class RunStore:
         include_subagents: bool = True,
         interval: float = 2.0,
         *,
+        _all_runs: Callable | None = None,
         _load_runs: Callable | None = None,
         _load_subagent_runs: Callable | None = None,
     ) -> None:
@@ -62,9 +56,12 @@ class RunStore:
         self._include_subagents = include_subagents
         self._interval = interval
 
-        # Pluggable loaders so tests never touch ~/.delegate or ~/.claude.
-        # When not overridden, import lazily to avoid import-time side effects
-        # (the real loaders stat ~ paths that may not exist).
+        # Pluggable loaders so tests never touch ~/.delegate, ~/.claude or the
+        # opencode database.  Production passes none of these and gets
+        # sessions.all_runs(); the legacy pair is still honoured because a
+        # loader is the seam every test in test_store.py is written against,
+        # and each one is loaded inside its own try/except either way.
+        self._all_runs_fn = _all_runs
         self._load_runs_fn = _load_runs
         self._load_subagent_runs_fn = _load_subagent_runs
 
@@ -72,7 +69,11 @@ class RunStore:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._status: str = ""
+        # Shown in the header until the first refresh lands. Without it an
+        # empty list is ambiguous — "nothing delegated yet" and "still reading
+        # four thousand transcripts" render identically, and the honest answer
+        # for the first two seconds is the second one.
+        self._status: str = "loading…"
         self._started = False
 
     # -- public API --------------------------------------------------------
@@ -121,6 +122,51 @@ class RunStore:
 
     # -- internal ----------------------------------------------------------
 
+    def _sources(self) -> list[Callable[[], list[Run]]]:
+        """The zero-argument loaders this refresh should call.
+
+        Production is one source — sessions.all_runs() already unifies and
+        de-duplicates across the ledger, opencode and Claude Code.  Splitting
+        it back into two calls here would just re-introduce the double-listing
+        it exists to prevent.
+        """
+        if self._load_runs_fn is not None or self._load_subagent_runs_fn is not None:
+            out: list[Callable[[], list[Run]]] = []
+            if self._load_runs_fn is not None:
+                out.append(lambda: self._load_runs_fn(ledger_path=self._ledger_path))
+            if self._load_subagent_runs_fn is not None:
+                out.append(lambda: self._load_subagent_runs_fn(
+                    limit=self._subagent_limit))
+            return out
+
+        fn = self._all_runs_fn
+        if fn is None:
+            from delegate_view.sessions import all_runs
+            fn = all_runs
+
+        # The Claude Code corpus is the only source big enough to need a cap,
+        # and --subagent-limit is the knob that already exists for it.  The
+        # opencode store is left uncapped: capping it is the bug this work
+        # was for.
+        return [lambda: fn(
+            ledger_path=self._ledger_path,
+            limit_per_source={"claude-code": self._subagent_limit},
+        )]
+
+    def _load(self) -> list[Run]:
+        """Every incoming run for this cycle.
+
+        Each source is isolated: one raising must not hide the others, which
+        is the whole reason this is a loop over callables and not one call.
+        """
+        out: list[Run] = []
+        for source in self._sources():
+            try:
+                out.extend(source())
+            except Exception:
+                continue
+        return out
+
     def _refresh(self) -> None:
         """One full refresh cycle: re-read sources and merge.
 
@@ -128,10 +174,14 @@ class RunStore:
         A cycle that raises must not kill the thread — the next cycle should
         still run.
         """
-        new_runs: list[Run] = []
-        new_runs.extend(self._safe_load_ledger())
-        if self._include_subagents:
-            new_runs.extend(self._safe_load_subagents())
+        new_runs = self._load()
+
+        # `include_subagents=False` hides agent-to-agent conversations, not a
+        # whole platform.  It used to mean "do not load Claude Code at all",
+        # which as a side effect also hid every direct chat there — the same
+        # coverage gap this store was fixed for, one flag down.
+        if not self._include_subagents:
+            new_runs = [r for r in new_runs if not r.is_subagent]
 
         # Build a lookup of incoming runs by key.
         incoming: dict[tuple, Run] = {}
@@ -139,8 +189,6 @@ class RunStore:
             incoming[key_of(r)] = r
 
         with self._lock:
-            existing = {key_of(r): r for r in self._runs}
-            merged_keys: list[tuple] = []
             merged: list[Run] = []
 
             # Walk the union of keys, preserving the order of existing runs
@@ -153,29 +201,14 @@ class RunStore:
                     # Update the existing object in place so the TUI's
                     # reference stays valid and the conversation cache
                     # is not invalidated.
-                    src = incoming[k]
-                    r.live = src.live
-                    r.size = src.size
-                    r.tokens_in = src.tokens_in
-                    r.tokens_out = src.tokens_out
-                    r.cost = src.cost
-                    r.prompt_text = src.prompt_text or r.prompt_text
-                    r.model = src.model or r.model
-                    r.cwd = src.cwd or r.cwd
-                    r.transcript = src.transcript or r.transcript
-                    r.session_id = src.session_id or r.session_id
-                    r.platform = src.platform or r.platform
-                    # Recompute liveness from the current mtime of the
-                    # transcript file, not from whatever the source said.
-                    r.live = _is_live(r)
+                    _update_in_place(r, incoming[k])
                 merged.append(r)
-                merged_keys.append(k)
                 seen.add(k)
 
             # Append runs that are genuinely new.
             for k, r in incoming.items():
                 if k not in seen:
-                    r.live = _is_live(r)
+                    r.live = is_live(r)
                     merged.append(r)
 
             # Runs that vanish from the source are kept, not dropped.
@@ -186,51 +219,66 @@ class RunStore:
 
             self._runs = merged
 
-    def _safe_load_ledger(self) -> list[Run]:
-        """Load from the ledger, returning [] on any error."""
-        try:
-            fn = self._load_runs_fn
-            if fn is None:
-                from delegate_view.runs import load_runs
-                fn = load_runs
-            return fn(ledger_path=self._ledger_path)
-        except Exception:
-            return []
-
-    def _safe_load_subagents(self) -> list[Run]:
-        """Load subagent runs, returning [] on any error."""
-        try:
-            fn = self._load_subagent_runs_fn
-            if fn is None:
-                from delegate_view.subagents import load_subagent_runs
-                fn = load_subagent_runs
-            return fn(limit=self._subagent_limit)
-        except Exception:
-            return []
-
     def _run_loop(self) -> None:
         """Background loop that refreshes on an interval."""
         # Do one immediate refresh so the list is populated quickly.
-        self._refresh()
+        try:
+            self._refresh()
+        except Exception:
+            pass
+        finally:
+            # Cleared even if the refresh blew up: a header stuck on
+            # "loading…" over a list that will never load is a worse lie
+            # than an empty list.
+            self._status = ""
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=self._interval)
             if self._stop_event.is_set():
                 break
-            self._refresh()
-        self._status = ""
+            try:
+                self._refresh()
+            except Exception:
+                # A cycle that raises must not kill the thread; the next
+                # cycle should still run. The sources are individually
+                # guarded, but the merge is not, and a dead refresh thread
+                # is a list that silently stops updating forever.
+                continue
+
+
+def _update_in_place(run: Run, src: Run) -> None:
+    """Copy this cycle's facts onto the Run object the TUI already holds.
+
+    Field by field rather than by replacing the object, because the TUI keys
+    its conversation cache on the object it is holding; swapping it would
+    re-read every open transcript from disk on every refresh.
+
+    Values that can legitimately go back to zero — stats, flags, the reason a
+    run ended — are copied straight across.  Values that are only ever
+    discovered, like a session id or a prompt, are never overwritten with
+    nothing: a source that momentarily fails to resolve must not erase what
+    an earlier cycle already learned.
+    """
+    run.size = src.size
+    run.tokens_in = src.tokens_in
+    run.tokens_out = src.tokens_out
+    run.cost = src.cost
+    run.failed = src.failed
+    run.end_reason = src.end_reason
+    run.is_subagent = src.is_subagent
+    run.updated = max(run.updated, src.updated)
+    run.prompt_text = src.prompt_text or run.prompt_text
+    run.model = src.model or run.model
+    run.cwd = src.cwd or run.cwd
+    run.transcript = src.transcript or run.transcript
+    run.session_id = src.session_id or run.session_id
+    run.platform = src.platform or run.platform
+    run.parent_id = src.parent_id or run.parent_id
+    run.source = src.source or run.source
+    # Recompute liveness from the current state of the transcript, not from
+    # whatever the source said when it built its list.
+    run.live = is_live(run)
 
 
 def _is_live(run: Run) -> bool:
-    """Recompute liveness from the current mtime of run.transcript.
-
-    A run with no transcript path is never live — the ledger's mtime is
-    meaningless because the ledger is rewritten by every new delegation.
-    """
-    transcript = run.transcript
-    if not transcript:
-        return False
-    try:
-        stat = os.stat(transcript)
-        return (time.time() - stat.st_mtime) < LIVE_WINDOW_S
-    except OSError:
-        return False
+    """Deprecated alias for runs.is_live, kept for callers that imported it."""
+    return is_live(run)

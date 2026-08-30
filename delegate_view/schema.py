@@ -11,6 +11,8 @@ schema. Platform-specific extras survive in Event.raw for anyone who needs
 them, without forcing every other adapter to invent a value.
 """
 
+import os
+import sys
 from dataclasses import dataclass, field
 
 # Event.kind values. Adapters must emit one of these and nothing else.
@@ -81,3 +83,38 @@ class Session:
     tokens_out: int = 0
     path: str = ""  # transcript file backing this session, when it is a file
     events: list[Event] = field(default_factory=list)
+
+
+# ── directory identity ──────────────────────────────────────────────────
+
+def norm_dir(path: str) -> str:
+    """A comparable identity for a working directory.
+
+    Two records that mean the same directory routinely spell it differently,
+    and an exact string compare then silently resolves nothing:
+
+    * `delegate.sh` records `$PWD`, the shell's LOGICAL path, while opencode
+      stores the PHYSICAL one.  On macOS `/tmp` is a symlink to `/private/tmp`,
+      so a run started in `/tmp/x` lands in the ledger as `/tmp/x` and in the
+      DB as `/private/tmp/x`.  realpath() collapses that.
+    * The default macOS filesystem is case-INSENSITIVE, so a `cd
+      ~/workspace/termdeck` records a different string than the
+      `~/workspace/Termdeck` the tool wrote, for the same directory.  realpath
+      does not fix case (it only follows symlinks), so the case fold does.
+
+    The case fold is wrong on a case-SENSITIVE volume, where `Foo` and `foo`
+    really are two directories.  That configuration is opt-in and rare on the
+    platforms this runs on, and the cost of getting it wrong there (two
+    unrelated directories treated as one, in a read-only viewer) is far
+    smaller than the cost of the default case being broken for everyone.
+    """
+    if not path:
+        return ""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        real = path
+    real = real.rstrip("/") or "/"
+    if sys.platform in ("darwin", "win32"):
+        return real.casefold()
+    return real

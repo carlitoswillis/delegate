@@ -10,6 +10,7 @@ which was the thing being removed.
 from __future__ import annotations
 
 import curses
+import time
 import unittest
 
 from delegate_view import views
@@ -19,6 +20,7 @@ from delegate_view.watch import (
     _index_of,
     _key_of,
     _row_to_index,
+    _run_is_subagent,
     resolve_key_action,
 )
 
@@ -432,26 +434,54 @@ class SelectionIdentityTests(unittest.TestCase):
 
 
 class RowToIndexTests(unittest.TestCase):
+    H = 24
+
     def test_header_rows_are_not_runs(self):
-        self.assertIsNone(_row_to_index(0, 0))
-        self.assertIsNone(_row_to_index(1, 0))
+        self.assertIsNone(_row_to_index(0, 0, self.H))
+        self.assertIsNone(_row_to_index(1, 0, self.H))
 
     def test_first_run_occupies_the_first_body_rows(self):
-        self.assertEqual(_row_to_index(2, 0), 0)
-        self.assertEqual(_row_to_index(3, 0), 0)
+        self.assertEqual(_row_to_index(2, 0, self.H), 0)
+        self.assertEqual(_row_to_index(3, 0, self.H), 0)
 
     def test_blank_separator_row_is_not_a_run(self):
-        self.assertIsNone(_row_to_index(4, 0))
+        self.assertIsNone(_row_to_index(4, 0, self.H))
 
     def test_second_run_follows_the_separator(self):
-        self.assertEqual(_row_to_index(5, 0), 1)
+        self.assertEqual(_row_to_index(5, 0, self.H), 1)
 
     def test_scrolling_shifts_the_mapping(self):
-        self.assertEqual(_row_to_index(2, 3), 1)
+        self.assertEqual(_row_to_index(2, 3, self.H), 1)
 
+    def test_chrome_rows_are_never_runs_however_far_the_list_is_scrolled(self):
+        # The header used to answer `list_scroll // 3` and the footer the run
+        # just below the viewport, so clicking either moved the selection to a
+        # run that was not on screen — and a second click opened it.
+        for h in (10, 14, 24, 40):
+            for scroll in (0, 3, 9, 30):
+                for y in (0, 1, h - 2, h - 1):
+                    self.assertIsNone(_row_to_index(y, scroll, h),
+                                      f"h={h} scroll={scroll} y={y}")
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_every_body_row_maps_to_the_run_drawn_on_it(self):
+        # Cross-check against the renderer rather than against arithmetic: the
+        # two must agree or a click lands on the wrong conversation.
+        runs = _runs(30)
+        for h in (14, 24, 40):
+            for sel in (0, 5, 20, 29):
+                scroll = views.list_scroll_for(sel, 0, h)
+                screen = views.render_list(runs, sel, 60, h, NOW, scroll=scroll)
+                for y in range(h):
+                    idx = _row_to_index(y, scroll, h)
+                    if idx is None or idx >= len(runs):
+                        continue
+                    # Only the first of a run's two rows carries its title;
+                    # the second is the meta line and shares the index.
+                    if (y - 2 + scroll) % (views.ROWS_PER_RUN + 1) != 0:
+                        continue
+                    drawn = text_of(screen[y]) if y < len(screen) else ""
+                    self.assertIn(views.run_title(runs[idx])[0], drawn,
+                                  f"h={h} sel={sel} y={y} -> run {idx}")
 
 
 class ListScrollMappingTests(unittest.TestCase):
@@ -481,9 +511,121 @@ class ListScrollMappingTests(unittest.TestCase):
         screen = views.render_list(_runs(40), sel, 80, h, NOW, scroll=scroll)
         marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
         self.assertEqual(len(marked), 1)
-        self.assertEqual(_row_to_index(marked[0], scroll), sel)
+        self.assertEqual(_row_to_index(marked[0], scroll, h), sel)
 
     def test_click_maps_correctly_at_the_top_of_an_unscrolled_list(self):
         screen = views.render_list(_runs(10), 0, 80, 24, NOW, scroll=0)
         marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
-        self.assertEqual(_row_to_index(marked[0], 0), 0)
+        self.assertEqual(_row_to_index(marked[0], 0, 24), 0)
+
+
+class FailedRunMarkTests(unittest.TestCase):
+    """A run that died is marked in the list, with its reason — the terminal
+    list must not read cleaner than the web list over the same ledger."""
+
+    def test_failed_run_shows_a_mark_and_its_reason(self):
+        run = FakeRun(live=False)
+        run.failed = True
+        run.end_reason = "failed (exit 3)"
+        out = "\n".join(_plain(views.render_list([run], 0, 80, 12, NOW)))
+        self.assertIn("✗", out)
+        self.assertIn("failed (exit 3)", out)
+
+    def test_a_live_run_is_never_marked_failed(self):
+        # `failed` is only ever set on runs that are over, but the marker
+        # logic should hold on its own: live wins.
+        run = FakeRun(live=True)
+        run.failed = True
+        out = "\n".join(_plain(views.render_list([run], 0, 80, 12, NOW)))
+        self.assertNotIn("✗", out)
+
+    def test_an_ordinary_finished_run_is_unmarked(self):
+        out = "\n".join(_plain(views.render_list([FakeRun()], 0, 80, 12, NOW)))
+        self.assertNotIn("✗", out)
+
+
+class SubagentInferenceTests(unittest.TestCase):
+    """_load_body trusts the run's own is_subagent flag.
+
+    The old inference — no prompt file means an agent spawned it — mislabels
+    a chat started directly in opencode, which also has no prompt file, and
+    the label decides whether the "user" turns read as you or as an agent.
+    """
+
+    def test_the_flag_wins_over_a_missing_prompt(self):
+        run = FakeRun(prompt="")
+        run.is_subagent = False
+        self.assertFalse(_run_is_subagent(run))
+
+    def test_the_flag_wins_over_a_present_prompt(self):
+        run = FakeRun(prompt="/p/tasks/task.md")
+        run.is_subagent = True
+        self.assertTrue(_run_is_subagent(run))
+
+    def test_legacy_runs_fall_back_to_the_prompt_inference(self):
+        self.assertTrue(_run_is_subagent(FakeRun(prompt="")))
+        self.assertFalse(_run_is_subagent(FakeRun(prompt="/p/tasks/task.md")))
+
+
+class ConversationLoaderTests(unittest.TestCase):
+    """The worker waits for requests instead of exiting between them.
+
+    The old worker returned the moment it had nothing to do, and a request
+    landing while the thread was still unwinding — after is_alive() said it
+    was fine — was silently lost.
+    """
+
+    def _loader_with_fake_load(self):
+        import delegate_view.watch as watch_mod
+
+        original = watch_mod._load_body
+        watch_mod._load_body = lambda run: ([], run.session_id)
+        loader = watch_mod.ConversationLoader()
+        self.addCleanup(setattr, watch_mod, "_load_body", original)
+        self.addCleanup(loader.stop)
+        return loader
+
+    def _wait_for_title(self, loader, title):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            body, got, gen, key = loader.result()
+            if got == title:
+                return gen
+            time.sleep(0.01)
+        self.fail(f"loader never produced {title!r}; "
+                  f"last result was {loader.result()[1]!r}")
+
+    def test_back_to_back_requests_both_land(self):
+        loader = self._loader_with_fake_load()
+        loader.request(FakeRun(session_id="s1", platform="opencode"))
+        gen1 = self._wait_for_title(loader, "s1")
+        # The worker is now idle-waiting on a finished conversation; a new
+        # request must still wake it.
+        loader.request(FakeRun(session_id="s2", platform="opencode"))
+        gen2 = self._wait_for_title(loader, "s2")
+        self.assertGreater(gen2, gen1, "generation moves with the body")
+
+    def test_result_names_the_conversation_it_belongs_to(self):
+        loader = self._loader_with_fake_load()
+        run = FakeRun(session_id="s1", platform="opencode")
+        loader.request(run)
+        self._wait_for_title(loader, "s1")
+        self.assertEqual(loader.result()[3],
+                         type(loader).key_for(run),
+                         "the loop needs this to tell a loaded body from "
+                         "the previous conversation's")
+
+    def test_a_finished_conversation_is_not_reread(self):
+        loader = self._loader_with_fake_load()
+        run = FakeRun(session_id="s1", platform="opencode", live=False)
+        loader.request(run)
+        gen = self._wait_for_title(loader, "s1")
+        for _ in range(5):
+            loader.request(run)
+            time.sleep(0.02)
+        self.assertEqual(loader.result()[2], gen,
+                         "same finished conversation, same generation")
+
+
+if __name__ == "__main__":
+    unittest.main()

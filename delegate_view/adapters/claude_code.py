@@ -19,11 +19,12 @@ Two things shape this adapter:
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
-from delegate_view.schema import Event, Session
+from delegate_view.schema import Event, Session, norm_dir
 
 # Records that are bookkeeping rather than conversation.
 _SKIP_TYPES = {
@@ -162,6 +163,56 @@ def _peek(path: Path) -> dict:
     return info
 
 
+def _cwd_variants(cwd: str) -> set[str]:
+    """Every spelling of a directory that could have been slugified.
+
+    The slug is built from whatever string the recording process reported, so
+    a caller holding a different spelling of the SAME directory builds a slug
+    that does not exist and finds nothing — silently.
+
+    Two systematic differences produce that, both seen in real data:
+
+    * logical vs physical paths. `delegate.sh` records the shell's `$PWD`
+      (`/tmp/x`); a process reports the resolved path (`/private/tmp/x`).
+      realpath() covers one direction, and the `/private` prefix — which is
+      the whole of the difference on macOS — covers the other, for a record
+      written from a logical path that this machine can no longer resolve.
+    * case. `~/workspace/termdeck` and `~/workspace/Termdeck` are one
+      directory on the default macOS filesystem, and both spellings appear in
+      the user's ledger and stores. Case is not handled here but by matching
+      the resulting slugs against real directory names case-insensitively.
+    """
+    variants = {cwd}
+    try:
+        variants.add(os.path.realpath(cwd))
+    except (OSError, ValueError):
+        pass
+    for v in list(variants):
+        if v.startswith("/private/"):
+            variants.add(v[len("/private"):])
+        elif v.startswith("/"):
+            variants.add("/private" + v)
+    return variants
+
+
+def _project_dirs_for(root: Path, cwd: str) -> list[Path]:
+    """Project directories that could hold transcripts for `cwd`.
+
+    Compares against the directory names that actually exist rather than
+    probing a guessed path, so a case difference between the recorded cwd and
+    the caller's is not a miss. Listing the project root is one cheap readdir
+    of a few dozen entries; the alternative on a miss is peeking every one of
+    ~4000 transcripts to read its recorded cwd.
+    """
+    wanted = {_slug_for_cwd(v).casefold() for v in _cwd_variants(cwd)}
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    return [p for p in entries
+            if p.is_dir() and p.name.casefold() in wanted]
+
+
 def list_sessions(db_path: Path | None = None,
                   cwd: str | None = None, *,
                   limit: int | None = None,
@@ -172,11 +223,19 @@ def list_sessions(db_path: Path | None = None,
 
     # When cwd is given, narrow to the slug directory so we peek only the
     # handful of transcripts for that project instead of scanning ~4000 files.
+    #
+    # Both spellings of the directory are tried, because the caller's cwd and
+    # the one Claude Code slugified may differ: the ledger records the shell's
+    # logical `$PWD` (`/tmp/x`) while a process reports the physical path
+    # (`/private/tmp/x`), and those slugify to different directory names. A
+    # single slug lookup returns [] for one of the two and the run silently
+    # never resolves.
     if cwd is not None:
-        slug_dir = root / _slug_for_cwd(cwd)
-        if not slug_dir.exists():
+        candidates = []
+        for slug_dir in _project_dirs_for(root, cwd):
+            candidates.extend(_iter_files(slug_dir))
+        if not candidates:
             return []
-        candidates = list(_iter_files(slug_dir))
     else:
         # 1. Glob every transcript path (cheap — ~0.02s for 4000+ files).
         candidates = list(_iter_files(root))
@@ -219,8 +278,10 @@ def list_sessions(db_path: Path | None = None,
         stat = stat_map[path]
         meta = _peek(path)
         # The slug is a fast path for FINDING files, never the authority on
-        # which cwd a transcript belongs to. The recorded cwd still decides.
-        if cwd is not None and meta["cwd"] != cwd:
+        # which cwd a transcript belongs to. The recorded cwd still decides —
+        # compared through norm_dir so a logical/physical or case difference
+        # does not reject a transcript that belongs here.
+        if cwd is not None and norm_dir(meta["cwd"]) != norm_dir(cwd):
             continue
         parent = _parent_of(path, root)
         # Subagent files carry the PARENT's sessionId in their records, so
@@ -244,12 +305,21 @@ def list_sessions(db_path: Path | None = None,
     return out
 
 
+# The only shapes a session id takes on disk: a uuid, `agent-<id>`, or a
+# workflow stem. Anything else — a path separator, a glob character — is not
+# an id, and since the id below is interpolated into a glob PATTERN, rejecting
+# it here is what keeps a crafted "id" from matching files it should not.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
 def _find_file(session_id: str, root: Path) -> Path | None:
     """Locate a transcript by id at any nesting depth.
 
     Checks the shallow path first so the common case does not pay for a full
     recursive walk of ~4000 files.
     """
+    if not _SESSION_ID_RE.match(session_id):
+        return None
     direct = list(root.glob(f"*/{session_id}.jsonl"))
     if direct:
         return direct[0]

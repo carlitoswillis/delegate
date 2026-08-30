@@ -9,7 +9,12 @@ import time
 import unittest
 from pathlib import Path
 
-from delegate_view.adapters.claude_code import _peek, _slug_for_cwd, list_sessions
+from delegate_view.adapters.claude_code import (
+    _peek,
+    _slug_for_cwd,
+    list_sessions,
+    load_session,
+)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -387,6 +392,84 @@ class TestSlugNarrowsCandidates(unittest.TestCase):
             result = list_sessions(db_path=root, cwd="/proj/a")
             self.assertEqual(result, [],
                              "Session with cwd mismatch should be excluded by content check")
+
+
+class TestCwdNormalization(unittest.TestCase):
+    """A logical cwd slugifies to a different project directory than a real one.
+
+    Claude Code names its project directory after the cwd the process
+    reported — the physical path.  A caller passing the shell's logical path
+    (`/tmp/x` where the real one is `/private/tmp/x`) builds a slug that does
+    not exist, and the lookup returns nothing at all.
+    """
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp())
+        self._root = self._tmp / "projects"
+        self._root.mkdir()
+
+    def _make(self, cwd_recorded: str) -> None:
+        project = _make_project(self._root, _slug_for_cwd(cwd_recorded))
+        _make_top_session(project, "sess-1", cwd=cwd_recorded)
+
+    def test_logical_path_finds_a_physically_slugged_project(self):
+        import os
+        real = self._tmp / "real"
+        real.mkdir()
+        link = self._tmp / "link"
+        os.symlink(real, link)
+
+        self._make(str(real))
+        found = list_sessions(self._root, cwd=str(link))
+        self.assertEqual([s.id for s in found], ["sess-1"])
+
+    def test_physical_path_finds_a_logically_slugged_project(self):
+        """The reverse direction: the record was written from `/tmp/x`.
+
+        macOS's `/private` prefix is the whole of the difference between the
+        two spellings, so it is tried in both directions — a machine that can
+        no longer resolve the symlink still finds the project.
+        """
+        self._make("/tmp/somewhere")
+        found = list_sessions(self._root, cwd="/private/tmp/somewhere")
+        self.assertEqual([s.id for s in found], ["sess-1"])
+
+    def test_logical_query_finds_a_physically_slugged_project(self):
+        self._make("/private/tmp/elsewhere")
+        found = list_sessions(self._root, cwd="/tmp/elsewhere")
+        self.assertEqual([s.id for s in found], ["sess-1"])
+
+    def test_case_difference_finds_the_project(self):
+        """`termdeck` in the ledger, `Termdeck` in the store — one directory."""
+        self._make("/Users/x/workspace/Termdeck")
+        found = list_sessions(self._root, cwd="/Users/x/workspace/termdeck")
+        self.assertEqual([s.id for s in found], ["sess-1"])
+
+    def test_unrelated_directory_still_matches_nothing(self):
+        self._make("/some/project")
+        self.assertEqual(list_sessions(self._root, cwd="/other/project"), [])
+
+
+class TestSessionIdValidation(unittest.TestCase):
+    """load_session interpolates the id into a glob pattern, so anything that
+    is not id-shaped — separators, glob characters, dot-dot — must be refused
+    before it reaches the filesystem."""
+
+    def test_junk_shaped_ids_are_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _make_top_session(_make_project(root, "proj"), "real-session")
+            for bad in ("../real-session", "*", "**", "a/b", "..",
+                        "[a]", "", "real-session/"):
+                with self.assertRaises(KeyError, msg=repr(bad)):
+                    load_session(bad, db_path=root)
+
+    def test_a_real_id_still_loads(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _make_top_session(_make_project(root, "proj"), "real-session")
+            self.assertEqual(load_session("real-session", db_path=root).id,
+                             "real-session")
 
 
 if __name__ == "__main__":

@@ -26,9 +26,93 @@ terminal attached.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 
 ELLIPSIS = "…"
+
+# Characters that occupy no cell at all: combining marks stack on the previous
+# glyph, and the format characters (ZWJ, ZWNJ, the bidi controls, the BOM) are
+# instructions to the shaper rather than things to draw.
+_ZERO_WIDTH = frozenset("\u200b\u200c\u200d\u200e\u200f\ufeff")
+
+# What a control character is drawn as. Transcripts carry raw ANSI colour
+# codes, NULs and BELs, and curses renders those in caret notation — two cells
+# for one character, which is exactly the kind of silent disagreement between
+# "how long is this string" and "how much screen does it take" that the rest of
+# this module exists to avoid. One character in, one cell out, always.
+_CONTROL_GLYPH = "·"
+_CONTROL_MAP = {c: _CONTROL_GLYPH for c in range(0x20)}
+_CONTROL_MAP[0x7F] = _CONTROL_GLYPH
+_CONTROL_MAP[0x9B] = _CONTROL_GLYPH
+
+
+def char_width(ch: str) -> int:
+    """Cells one character occupies on a terminal: 0, 1 or 2.
+
+    Everything above measures text in *cells*, not in characters, and the two
+    are the same number only for the ASCII the layout was originally written
+    against. A CJK or emoji transcript makes them differ by a factor of two,
+    and every consequence of that is a rendering bug: `pad` stops filling the
+    row, `truncate` clips at the wrong column, `wrap` breaks a line long after
+    it has run off the edge, and `paint` writes past the last column so curses
+    wraps the overflow onto the row below and eats it.
+
+    East Asian "Ambiguous" is counted as one cell. Every glyph this UI draws
+    for itself — the rule, the box lines, the thumb, the ellipsis — is
+    Ambiguous, and they are all one cell wide in the terminals people run this
+    in. Counting them as two would corrupt the layout in the ordinary case to
+    be right in the rare one.
+    """
+    if not ch:
+        return 0
+    o = ord(ch)
+    if o < 0x20 or o == 0x7F:
+        return 1                       # drawn as _CONTROL_GLYPH
+    if o < 0x7F:
+        return 1                       # the ASCII fast path
+    if ch in _ZERO_WIDTH or unicodedata.combining(ch):
+        return 0
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def cell_width(text: str) -> int:
+    """Cells a string occupies. The ASCII case stays a plain len()."""
+    if text.isascii():
+        return len(text)
+    return sum(char_width(c) for c in text)
+
+
+def fit(text: str, cells: int, start: int = 0) -> int:
+    """Index one past the last character of `text[start:]` fitting in `cells`.
+
+    Never splits a double-width character: a half-drawn glyph is not a cheaper
+    failure than a missing one, and curses would refuse to draw it anyway.
+    """
+    if cells <= 0:
+        return start
+    used = 0
+    i = start
+    n = len(text)
+    while i < n:
+        w = char_width(text[i])
+        if used + w > cells:
+            break
+        used += w
+        i += 1
+    return i
+
+
+def printable(text: str) -> str:
+    """Swap control characters for a placeholder, one character for one.
+
+    Applied at paint time only. Doing it here rather than at the source keeps
+    every length already computed upstream valid, because the substitution
+    preserves both the character count and the cell count.
+    """
+    return text.translate(_CONTROL_MAP)
 
 
 @dataclass(frozen=True)
@@ -78,7 +162,8 @@ def text_of(line: Line) -> str:
 
 
 def width_of(line: Line) -> int:
-    return sum(len(s.text) for s in line)
+    """Cells the line occupies — not characters. See `char_width`."""
+    return sum(cell_width(s.text) for s in line)
 
 
 def styles_of(line: Line) -> list[tuple[str, str]]:
@@ -108,18 +193,17 @@ def truncate(line: Line, width: int, ellipsis: str = ELLIPSIS) -> Line:
         first = line[0].style if line else ""
         return [Span(ellipsis, first)]
 
-    keep = width - len(ellipsis)
+    keep = width - cell_width(ellipsis)
     out: Line = []
     used = 0
     last_style = ""
     for s in line:
         if used >= keep:
             break
-        room = keep - used
-        chunk = s.text[:room]
+        chunk = s.text[: fit(s.text, keep - used)]
         if chunk:
             out.append(Span(chunk, s.style))
-            used += len(chunk)
+            used += cell_width(chunk)
             last_style = s.style
     out.append(Span(ellipsis, last_style))
     return out
@@ -136,17 +220,26 @@ def truncate_left(line: Line, width: int, ellipsis: str = ELLIPSIS) -> Line:
     if width == 1:
         return [Span(ellipsis, line[0].style if line else "")]
 
-    keep = width - len(ellipsis)
+    keep = width - cell_width(ellipsis)
     drop = total - keep
     out: Line = [Span(ellipsis, line[0].style if line else "")]
     seen = 0
     for s in line:
-        if seen + len(s.text) <= drop:
-            seen += len(s.text)
+        w = cell_width(s.text)
+        if seen + w <= drop:
+            seen += w
             continue
-        start = max(0, drop - seen)
-        chunk = s.text[start:]
-        seen += len(s.text)
+        # `fit` from the front tells us how many characters make up the cells
+        # being dropped, which is the only way to cut a mixed-width span at a
+        # cell boundary without landing inside a glyph. When the boundary lands
+        # mid-glyph we drop that glyph too: one cell of slack is invisible,
+        # one cell of overflow is not.
+        want = max(0, drop - seen)
+        cut = fit(s.text, want)
+        if cut < len(s.text) and cell_width(s.text[:cut]) < want:
+            cut += 1
+        chunk = s.text[cut:]
+        seen += w
         if chunk:
             out.append(Span(chunk, s.style))
     return out
@@ -171,10 +264,10 @@ def pad(line: Line, width: int, style: str = "") -> Line:
         for s in line:
             if used >= width:
                 break
-            chunk = s.text[: width - used]
+            chunk = s.text[: fit(s.text, width - used)]
             if chunk:
                 out.append(Span(chunk, s.style))
-                used += len(chunk)
+                used += cell_width(chunk)
         return out
     return list(line) + [Span(" " * (width - cur), style)]
 
@@ -254,13 +347,16 @@ def wrap(line: Line, width: int, subsequent_indent: str = "") -> list[Line]:
         if avail <= 0:
             avail = width
 
+        # `limit` is a character index but the budget is in cells, and `fit`
+        # is the conversion. Counting characters here is what let a line of
+        # CJK run to twice the width of the column it was wrapped for.
         if first:
             # The indent is part of the text, so it is already accounted for.
             seg_start = pos
-            limit = pos + width
+            limit = fit(text, width, pos)
         else:
             seg_start = pos
-            limit = pos + avail
+            limit = fit(text, avail, pos)
 
         if limit >= n:
             chunk_end = n
@@ -278,7 +374,9 @@ def wrap(line: Line, width: int, subsequent_indent: str = "") -> list[Line]:
                 chunk_end = seg_start + brk
 
         if chunk_end <= seg_start:
-            chunk_end = min(n, seg_start + max(1, avail))
+            # A single character wider than the whole column. Emit it alone
+            # rather than looping forever on a window nothing fits into.
+            chunk_end = min(n, seg_start + 1)
 
         piece = slice_line(line, seg_start, chunk_end)
         if first:
@@ -319,7 +417,12 @@ def paint(win, y: int, x: int, line: Line, theme) -> None:
     for s in line:
         if col >= max_x:
             break
-        chunk = s.text[: max_x - col]
+        # Clip by cells, not by characters. A span of CJK or emoji clipped by
+        # character count is twice as wide as the room left, and curses does
+        # not stop at the margin — it wraps the overflow onto the next row and
+        # then the next row's own text overwrites part of it, which is what
+        # turned an emoji-heavy transcript into shredded columns.
+        chunk = printable(s.text[: fit(s.text, max_x - col)])
         if not chunk:
             continue
         attr = 0
@@ -329,7 +432,10 @@ def paint(win, y: int, x: int, line: Line, theme) -> None:
             attr = 0
         try:
             win.addstr(y, col, chunk, attr)
-        except curses.error:
+        except (curses.error, ValueError, UnicodeError):
             # Expected on the bottom-right cell; the text is drawn regardless.
+            # ValueError is the embedded-NUL case and UnicodeError a character
+            # the terminal's encoding cannot carry — neither is worth losing
+            # the rest of the frame over.
             pass
-        col += len(chunk)
+        col += cell_width(chunk)

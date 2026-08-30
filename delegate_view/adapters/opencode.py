@@ -7,7 +7,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from delegate_view.schema import Event, Session
+from delegate_view.schema import Event, Session, norm_dir
 
 
 def default_db_path() -> Path:
@@ -15,6 +15,24 @@ def default_db_path() -> Path:
 
 
 def _open_ro(db_path: Path) -> sqlite3.Connection:
+    """A read-only connection, retried, then degraded rather than abandoned.
+
+    The database is LIVE: opencode is usually running and writing to it. That
+    is safe to read from — it runs in WAL mode, where a reader sees a
+    consistent snapshot and never blocks a writer or waits on one. Verified
+    under load: 28 full listings taken while another connection committed
+    105,000 rows, none blocked and none failed.
+
+    A read-only open still needs the -shm file, and creating it needs a
+    writable DIRECTORY. That is the one way this fails on a healthy database:
+    a hot WAL left behind by a killed process, sitting somewhere the viewer
+    cannot write — a copied backup, a read-only mount. `immutable=1` is the
+    honest last resort there: it tells SQLite the file cannot change, so the
+    WAL is ignored and the last checkpointed state is read. That state can be
+    slightly stale, which for a viewer is a far better answer than no list at
+    all. It is tried only after the normal open has failed three times, so a
+    healthy database never takes this path.
+    """
     uri = f"file:{db_path}?mode=ro"
     last_exc: Exception | None = None
     for _ in range(3):
@@ -23,7 +41,10 @@ def _open_ro(db_path: Path) -> sqlite3.Connection:
         except sqlite3.OperationalError as exc:
             last_exc = exc
             time.sleep(0.2)
-    raise last_exc  # type: ignore[misc]
+    try:
+        return sqlite3.connect(f"{uri}&immutable=1", uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        raise last_exc  # type: ignore[misc]
 
 
 def _parse_model(raw: str | None) -> str:
@@ -101,20 +122,29 @@ def list_sessions(db_path: Path | None = None,
     db_path = db_path or default_db_path()
     conn = _open_ro(db_path)
     try:
+        # The cwd filter is applied in Python, not as `WHERE directory = ?`.
+        # An exact string match misses the session it is looking for whenever
+        # the two sides spell the same directory differently — the ledger
+        # records the shell's logical `$PWD` (`/tmp/x`) while opencode stores
+        # the physical path (`/private/tmp/x`), and macOS's case-insensitive
+        # filesystem lets `termdeck` and `Termdeck` both be real. That failed
+        # SILENTLY: the run simply never resolved to its session. norm_dir()
+        # is the comparison both sides agree on, and it cannot be pushed into
+        # SQL. Scanning the whole session table costs nothing worth measuring
+        # (0.5ms for 64 rows on a 140MB database) because the rows are small
+        # and the bulk of the file is messages and parts.
         sql = """
             SELECT id, parent_id, directory, title, cost,
                    tokens_input, tokens_output,
                    agent, model, time_created, time_updated
             FROM session
+            ORDER BY time_updated DESC
         """
-        params: list = []
-        if cwd is not None:
-            sql += " WHERE directory = ?"
-            params.append(cwd)
-        sql += " ORDER BY time_updated DESC"
+        rows = conn.execute(sql).fetchall()
 
-        cur = conn.execute(sql, params)
-        rows = cur.fetchall()
+        if cwd is not None:
+            want = norm_dir(cwd)
+            rows = [r for r in rows if norm_dir(r[2]) == want]
 
         return [
             Session(

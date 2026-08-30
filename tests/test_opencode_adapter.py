@@ -288,3 +288,61 @@ class TestDefaultDbPath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCwdNormalization(_Base):
+    """The directory the caller asks about is spelled many ways.
+
+    delegate.sh records the shell's LOGICAL `$PWD`; opencode stores the
+    PHYSICAL path.  On macOS `/tmp` is a symlink to `/private/tmp`, so an
+    exact `WHERE directory = ?` matched nothing and the run silently never
+    resolved to its session.
+    """
+
+    def test_symlinked_directory_matches(self):
+        import os
+        real = self._tmp / "real"
+        real.mkdir()
+        link = self._tmp / "link"
+        os.symlink(real, link)
+
+        self._insert_session(id="a", directory=str(real))
+        self.assertEqual([s.id for s in list_sessions(self._db, cwd=str(link))],
+                         ["a"])
+
+    def test_stored_symlink_matches_a_real_query(self):
+        """Normalization has to work whichever side is the logical one."""
+        import os
+        real = self._tmp / "real2"
+        real.mkdir()
+        link = self._tmp / "link2"
+        os.symlink(real, link)
+
+        self._insert_session(id="a", directory=str(link))
+        self.assertEqual([s.id for s in list_sessions(self._db, cwd=str(real))],
+                         ["a"])
+
+    def test_trailing_slash_matches(self):
+        self._insert_session(id="a", directory="/foo/bar")
+        self.assertEqual([s.id for s in list_sessions(self._db, cwd="/foo/bar/")],
+                         ["a"])
+
+    def test_case_difference_matches_on_case_insensitive_platforms(self):
+        """`cd ~/workspace/termdeck` and `~/workspace/Termdeck` are one place.
+
+        Both spellings are in the user's real data: the ledger recorded the
+        lowercase one and opencode stored the capitalised one, and those runs
+        resolved to nothing at all.
+        """
+        import sys
+        self._insert_session(id="a", directory="/Users/x/workspace/Termdeck")
+        found = [s.id for s in
+                 list_sessions(self._db, cwd="/Users/x/workspace/termdeck")]
+        if sys.platform in ("darwin", "win32"):
+            self.assertEqual(found, ["a"])
+        else:
+            self.assertEqual(found, [])
+
+    def test_a_genuinely_different_directory_still_does_not_match(self):
+        self._insert_session(id="a", directory="/foo/bar")
+        self.assertEqual(list_sessions(self._db, cwd="/foo/baz"), [])

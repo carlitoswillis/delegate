@@ -1,0 +1,447 @@
+/* delegate — mobile-first transcript reader.
+ *
+ * The phone is the design target, not a breakpoint. Everything here assumes a
+ * ~380px column held one-handed, and the only wide-screen concession is a max
+ * width so lines stay readable on a laptop.
+ *
+ * Two rules the whole sheet exists to enforce:
+ *   1. The page never scrolls sideways. Prose wraps anywhere it must; code and
+ *      tool output scroll inside their own boxes. A transcript is full of
+ *      120-column diffs, and one of them escaping its container makes every
+ *      other paragraph on the page unreadable on a phone.
+ *   2. Tap targets are at least 44px tall. A run in the list is a link the
+ *      size of a card, not a line of text you have to aim at.
+ *
+ * Colours are declared as tokens on :root (light) and redefined once under
+ * prefers-color-scheme: dark. No colour is defined only inside the media
+ * query, so a browser that never reports a scheme still gets a full palette.
+ */
+
+:root {
+  --bg: #f7f7f8;
+  --bg-raise: #ffffff;
+  --bg-sunk: #eeeef1;
+  --fg: #1b1c20;
+  --fg-dim: #6a6d78;
+  --fg-faint: #8e919b;
+  --line: #dcdce2;
+  --accent: #2f6df6;
+  --user: #7a4de0;
+  --assistant: #1f8a5f;
+  --tool: #b4740c;
+  --err: #cf2f42;
+  --live: #17a35c;
+  --code-bg: #f1f1f4;
+  --radius: 12px;
+  --pad: 14px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101218;
+    --bg-raise: #171a22;
+    --bg-sunk: #0b0d12;
+    --fg: #e6e8ee;
+    --fg-dim: #99a0b0;
+    --fg-faint: #6d7484;
+    --line: #262b36;
+    --accent: #6f9dff;
+    --user: #b18cff;
+    --assistant: #4fd39a;
+    --tool: #e6b455;
+    --err: #ff7a8a;
+    --live: #3ddc8a;
+    --code-bg: #0c0f15;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.55 var(--sans);
+  /* The one place horizontal overflow is forbidden outright. Anything that
+   * needs more width than this scrolls inside itself. */
+  overflow-x: hidden;
+  overscroll-behavior-y: none;
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+}
+
+a { color: var(--accent); }
+
+code, pre { font-family: var(--mono); }
+
+/* ── sticky header ─────────────────────────────────────────────────── */
+
+.top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  -webkit-backdrop-filter: saturate(1.6) blur(12px);
+  backdrop-filter: saturate(1.6) blur(12px);
+  border-bottom: 1px solid var(--line);
+  padding: calc(10px + env(safe-area-inset-top)) var(--pad) 10px;
+}
+
+.top-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand { font-weight: 650; letter-spacing: -0.01em; }
+.count { color: var(--fg-dim); font-size: 13px; margin-left: auto; }
+
+.filter {
+  margin-top: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 12px;
+  font: 16px var(--sans); /* 16px or iOS zooms the whole page on focus */
+  color: var(--fg);
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  -webkit-appearance: none;
+}
+.filter:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: -10px 0 -10px -10px;
+  font-size: 30px;
+  line-height: 1;
+  text-decoration: none;
+  color: var(--fg-dim);
+  flex: 0 0 auto;
+}
+.back:active { color: var(--fg); }
+
+.conv-title {
+  font-weight: 620;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+
+.chip {
+  font: 11px/1.7 var(--mono);
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-raise);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.chip.subtle { border-color: transparent; background: var(--bg-sunk); }
+.chip.livechip { color: var(--live); border-color: currentColor; }
+.chip.failchip { color: var(--err); border-color: currentColor; }
+
+/* ── run list ──────────────────────────────────────────────────────── */
+
+.list, .conv { max-width: 780px; margin: 0 auto; padding: 10px var(--pad); }
+
+.runs { list-style: none; margin: 0; padding: 0; }
+
+.run + .run { margin-top: 8px; }
+
+.run-link {
+  display: block;
+  min-height: 62px;               /* comfortably past the 44px tap floor */
+  padding: 11px 13px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  text-decoration: none;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+.run-link:active { background: var(--bg-sunk); }
+.run.live .run-link { border-color: color-mix(in srgb, var(--live) 45%, var(--line)); }
+.run.failed .run-link { border-color: color-mix(in srgb, var(--err) 30%, var(--line)); }
+
+.run-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+.run-title {
+  font-weight: 560;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dot {
+  flex: 0 0 auto;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+.dot.live { background: var(--live); animation: pulse 1.6s ease-in-out infinite; }
+.dot.failed { background: var(--err); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .dot.live { animation: none; } }
+
+.run-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  min-width: 0;
+}
+.run-bits {
+  color: var(--fg-dim);
+  font-size: 12.5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty, .notice {
+  color: var(--fg-dim);
+  font-size: 14px;
+  padding: 18px 2px;
+  text-align: center;
+}
+.notice {
+  padding: 10px;
+  margin-bottom: 12px;
+  background: var(--bg-sunk);
+  border-radius: 10px;
+}
+
+/* ── conversation blocks ───────────────────────────────────────────── */
+
+.block { margin: 0 0 12px; }
+
+.speaker {
+  font: 11.5px/1 var(--mono);
+  letter-spacing: 0.02em;
+  color: var(--fg-dim);
+  margin-bottom: 5px;
+  overflow-wrap: anywhere;
+}
+
+.turn-body {
+  border-left: 3px solid var(--line);
+  padding-left: 11px;
+}
+.turn.user .turn-body { border-color: var(--user); }
+.turn.assistant .turn-body { border-color: var(--assistant); }
+.turn.user .speaker { color: var(--user); }
+.turn.assistant .speaker { color: var(--assistant); }
+
+.prose {
+  margin: 0 0 9px;
+  /* pre-wrap keeps the transcript's own line breaks — an agent's numbered
+   * list is meaningless reflowed into a paragraph — while anywhere stops a
+   * long path or URL from pushing the page sideways. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.prose:last-child { margin-bottom: 0; }
+
+.code {
+  position: relative;
+  margin: 0 0 9px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.code pre {
+  margin: 0;
+  padding: 10px 11px;
+  overflow-x: auto;               /* the escape valve: code scrolls, page does not */
+  -webkit-overflow-scrolling: touch;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.code .lang {
+  position: absolute;
+  top: 4px; right: 8px;
+  font: 10px var(--mono);
+  color: var(--fg-faint);
+  pointer-events: none;
+}
+
+/* ── collapsibles: reasoning and tool calls ────────────────────────── */
+
+details.block {
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+details.block > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  min-width: 0;
+}
+details.block > summary::-webkit-details-marker { display: none; }
+details.block > summary:active { background: var(--bg-sunk); }
+details.block[open] > summary { border-bottom: 1px solid var(--line); }
+
+.tag {
+  font: 11px var(--mono);
+  color: var(--fg-faint);
+  flex: 0 0 auto;
+}
+.teaser, .tool-arg {
+  color: var(--fg-dim);
+  font: 12.5px var(--mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning { border-style: dashed; }
+.reasoning-body {
+  margin: 0;
+  padding: 11px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13.5px;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+.tool .ico { flex: 0 0 auto; font-size: 13px; }
+.tool.ok .ico { color: var(--assistant); }
+.tool.err .ico { color: var(--err); }
+.tool.pending .ico { color: var(--fg-faint); }
+.tool.err { border-color: color-mix(in srgb, var(--err) 45%, var(--line)); }
+
+.tool-name {
+  font: 600 13px var(--mono);
+  color: var(--tool);
+  flex: 0 0 auto;
+}
+.took {
+  margin-left: auto;
+  font: 11px var(--mono);
+  color: var(--fg-faint);
+  flex: 0 0 auto;
+}
+
+.tool-body { padding: 4px 0 0; }
+
+.arg, .out { padding: 8px 12px; }
+.arg + .arg, .out { border-top: 1px dashed var(--line); }
+.arg-k, .out-k {
+  font: 11px var(--mono);
+  color: var(--fg-faint);
+  margin-bottom: 4px;
+}
+.arg-v pre, .out pre {
+  margin: 0;
+  padding: 8px 9px;
+  background: var(--code-bg);
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  max-height: 45vh;               /* one call cannot own the whole screen */
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.empty-out { color: var(--fg-faint); font-size: 12.5px; }
+.clip { margin-top: 5px; font: 11px var(--mono); color: var(--fg-faint); }
+
+.patch {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 9px 12px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font: 13px var(--mono);
+}
+.patch .files { color: var(--tool); overflow-wrap: anywhere; min-width: 0; }
+
+.compaction {
+  text-align: center;
+  color: var(--fg-faint);
+  font: 11px var(--mono);
+  border-top: 1px dashed var(--line);
+  padding-top: 10px;
+}
+
+.raw pre {
+  margin: 0;
+  padding: 10px 11px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  white-space: pre;
+}
+
+/* ── jump-to-latest ────────────────────────────────────────────────── */
+
+.to-bottom {
+  position: fixed;
+  right: 14px;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  width: 46px; height: 46px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--bg-raise);
+  color: var(--fg-dim);
+  font-size: 20px;
+  line-height: 1;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  display: none;
+  z-index: 20;
+}
+.to-bottom.show { display: block; }
+
+/* ── error pages ───────────────────────────────────────────────────── */
+
+.mid {
+  max-width: 460px;
+  margin: 12vh auto;
+  padding: 0 var(--pad);
+  text-align: center;
+}
+.mid h1 { font-size: 44px; margin: 0 0 6px; color: var(--fg-dim); }
+.mid .hint { color: var(--fg-dim); font-size: 14px; }
+.btn {
+  display: inline-block;
+  min-height: 44px;
+  line-height: 44px;
+  padding: 0 18px;
+  border-radius: 10px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  text-decoration: none;
+}
+
+@media (min-width: 700px) {
+  body { font-size: 16.5px; }
+  .list, .conv { padding: 16px 20px 40px; }
+}

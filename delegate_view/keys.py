@@ -135,6 +135,28 @@ class InputDecoder:
     subsequent keystroke, so the buffer is capped and flushed back as a plain
     ESC when it overruns — a stray ESC is recoverable, a wedged input path is
     not.
+
+    Two things here exist because of what ESC *means* upstream: in the list
+    view it quits, and in a conversation it goes back. That makes ESC the most
+    destructive byte in the stream, and both of the following were firing it
+    when the user had not pressed it.
+
+    * **An unknown CSI sequence is swallowed, not replayed.** curses with
+      keypad(True) has already translated every escape sequence it recognises,
+      so anything still arriving as ``ESC [ …`` is one curses has no name for:
+      a focus-in/out report (``ESC[I`` / ``ESC[O``), a bracketed-paste marker
+      (``ESC[200~``), a cursor-position reply. Terminals emit those unbidden.
+      Replaying the bytes emitted a leading ESC and quit the app the moment
+      the window took focus. CSI has a grammar — parameter and intermediate
+      bytes, then one final byte in 0x40..0x7E — so we follow it to the end
+      and emit nothing. Ignoring a sequence we cannot name is the only reading
+      of it that cannot be wrong.
+
+    * **A lone ESC is emitted on the first idle tick.** Held in the buffer
+      waiting for a byte that never comes, it made the Esc key do nothing at
+      all until the user pressed something else. `feed(-1)` — the caller's
+      "getch timed out" signal — is the evidence that nothing followed, which
+      is exactly the question ESCDELAY answers for curses' own decoder.
     """
 
     _MAX_SEQ = 32
@@ -142,10 +164,12 @@ class InputDecoder:
     def __init__(self) -> None:
         self._buf: list[int] = []
         self._pending: list[tuple[str, object]] = []
+        self._csi = False    # inside an unknown CSI we are swallowing whole
 
     def reset(self) -> None:
         self._buf = []
         self._pending = []
+        self._csi = False
 
     def pending(self) -> int:
         """How many decoded events are queued behind the last return."""
@@ -168,6 +192,7 @@ class InputDecoder:
         """
         tail = self._buf[1:]
         self._buf = []
+        self._csi = False
         if replay:
             for c in tail:
                 self._pending.append(("key", c))
@@ -184,13 +209,24 @@ class InputDecoder:
             return self._pending.pop(0)
 
         if code < 0:
-            return None
+            return self._idle()
 
         if not self._buf:
             if code == ESC:
                 self._buf = [code]
                 return None
             return ("key", code)
+
+        # Swallowing a CSI curses could not name: run to its final byte.
+        if self._csi:
+            self._buf.append(code)
+            if 0x40 <= code <= 0x7E:
+                self._buf = []
+                self._csi = False
+            elif len(self._buf) > self._MAX_SEQ:
+                self._buf = []
+                self._csi = False
+            return None
 
         # Still deciding whether this is a mouse report at all.
         if len(self._buf) == 1:
@@ -200,7 +236,14 @@ class InputDecoder:
             return None
         if len(self._buf) == 2:
             if code != ord("<"):
-                return self._abandon(code, replay=True)
+                # Not a mouse report, but still a CSI. Swallow it whole rather
+                # than replaying an ESC that would quit the app.
+                self._csi = True
+                self._buf.append(code)
+                if 0x40 <= code <= 0x7E:
+                    self._buf = []
+                    self._csi = False
+                return None
             self._buf.append(code)
             return None
 
@@ -218,4 +261,20 @@ class InputDecoder:
         if len(self._buf) > self._MAX_SEQ:
             return self._abandon(None, replay=False)
 
+        return None
+
+    def _idle(self) -> tuple[str, object] | None:
+        """Nothing arrived this tick. Resolve whatever is still buffered.
+
+        A lone ESC is the Esc key and comes out now; anything longer is a
+        sequence that was cut off mid-flight and is dropped, because emitting
+        its head would mean emitting an ESC the user never pressed.
+        """
+        if not self._buf:
+            return None
+        if self._buf == [ESC]:
+            self._buf = []
+            return ("key", ESC)
+        self._buf = []
+        self._csi = False
         return None

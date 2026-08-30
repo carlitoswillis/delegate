@@ -12,6 +12,10 @@ import unittest
 from delegate_view.render import (
     Span,
     blank,
+    cell_width,
+    char_width,
+    fit,
+    printable,
     hstack,
     line_of,
     pad,
@@ -218,6 +222,86 @@ class StyleForModelTests(unittest.TestCase):
 
     def test_case_insensitive(self):
         self.assertEqual(style_for_model("CLAUDE-OPUS"), "model.anthropic")
+
+
+class CellWidthTests(unittest.TestCase):
+    """Layout is measured in terminal cells, not in Python characters.
+
+    Every one of these used to be counted as one cell, so a transcript with
+    CJK or emoji in it was laid out to twice the width of the column it was
+    given — and `paint` then wrote the overflow onto the row below.
+    """
+
+    def test_ascii_is_one_cell_each(self):
+        self.assertEqual(cell_width("hello"), 5)
+        self.assertEqual(char_width("a"), 1)
+
+    def test_cjk_and_emoji_are_two_cells(self):
+        for ch in "漢字あ가🎉🚀":
+            self.assertEqual(char_width(ch), 2, ch)
+        self.assertEqual(cell_width("漢字"), 4)
+
+    def test_combining_and_zero_width_are_free(self):
+        self.assertEqual(char_width("\u0301"), 0)     # combining acute
+        self.assertEqual(char_width("\u200d"), 0)     # zero width joiner
+        self.assertEqual(char_width("\ufeff"), 0)     # byte order mark
+        self.assertEqual(cell_width("e\u0301"), 1)
+
+    def test_the_ui_glyphs_stay_one_cell(self):
+        # These are East Asian "Ambiguous". Counting them as two would break
+        # every layout in this app to be right about a font nobody uses here.
+        for ch in "▎─│█…·▸⠋✓✗⋯±":
+            self.assertEqual(char_width(ch), 1, ch)
+
+    def test_control_characters_measure_and_render_as_one(self):
+        # curses draws these in caret notation, two cells for one character.
+        # We substitute one placeholder per character so the two agree.
+        self.assertEqual(cell_width("\x1b[0m"), 4)
+        self.assertEqual(printable("a\x00\x1b\x07b"), "a···b")
+        self.assertEqual(len(printable("\x1b[31m")), len("\x1b[31m"))
+
+    def test_width_of_counts_cells(self):
+        self.assertEqual(width_of([Span("漢字", "x"), Span("ab")]), 6)
+
+    def test_fit_never_splits_a_wide_character(self):
+        self.assertEqual(fit("漢字", 3), 1)     # only one fits in three cells
+        self.assertEqual(fit("漢字", 4), 2)
+        self.assertEqual(fit("漢字", 1), 0)
+        self.assertEqual(fit("ab漢", 3, 0), 2)
+
+
+class WideCharLayoutTests(unittest.TestCase):
+    def test_pad_fills_to_the_cell_count(self):
+        self.assertEqual(width_of(pad(line_of(Span("漢字")), 10)), 10)
+
+    def test_pad_clips_to_the_cell_count(self):
+        out = pad(line_of(Span("漢字漢字漢字")), 5)
+        self.assertLessEqual(width_of(out), 5)
+        self.assertEqual(text_of(out), "漢字")   # never half a glyph
+
+    def test_truncate_measures_in_cells(self):
+        out = truncate(line_of(Span("漢字漢字漢字")), 6)
+        self.assertLessEqual(width_of(out), 6)
+        self.assertTrue(text_of(out).endswith("…"))
+
+    def test_truncate_left_measures_in_cells(self):
+        out = truncate_left(line_of(Span("漢字漢字漢字")), 6)
+        self.assertLessEqual(width_of(out), 6)
+
+    def test_wrap_never_exceeds_the_column_in_cells(self):
+        for text in ("漢字テスト" * 20, "🎉" * 40, "日a本b語c" * 20,
+                     "mixed 漢字 and ascii " * 10):
+            for width in (5, 12, 40, 79):
+                for ln in wrap(line_of(Span(text)), width):
+                    self.assertLessEqual(width_of(ln), width,
+                                         f"{text[:10]!r} @ {width}")
+
+    def test_wrap_makes_progress_on_a_glyph_wider_than_the_column(self):
+        # A two-cell character in a one-cell column has no honest answer; the
+        # only wrong one is looping forever.
+        out = wrap(line_of(Span("漢字漢")), 1)
+        self.assertEqual(len(out), 3)
+        self.assertEqual("".join(text_of(l) for l in out), "漢字漢")
 
 
 if __name__ == "__main__":

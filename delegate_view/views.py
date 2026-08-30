@@ -113,6 +113,12 @@ def _run_rows(run, *, selected: bool, width: int, now_ms: int,
 
     if run.live:
         marker = Span(SPINNER[spin_frame % len(SPINNER)], "live")
+    elif getattr(run, "failed", False):
+        # Marked, never hidden: the ledger is append-only so the record of
+        # what was asked survives a run that died, and the web list already
+        # flags these — the terminal list should not read cleaner than
+        # reality.
+        marker = Span("✗", "error")
     else:
         marker = Span("·", "idle")
 
@@ -150,6 +156,9 @@ def _run_rows(run, *, selected: bool, width: int, now_ms: int,
         cost = format_cost(getattr(run, "cost", 0.0))
         if cost:
             parts.append(cost)
+
+    if getattr(run, "failed", False) and getattr(run, "end_reason", ""):
+        parts.append(run.end_reason)
 
     meta = line_of(Span("     "), Span(" · ".join(parts), "age"))
     meta = pad(truncate(meta, width), width)

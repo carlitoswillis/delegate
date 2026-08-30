@@ -30,7 +30,7 @@ import traceback
 
 from delegate_view import views
 from delegate_view.keys import MOUSE_OFF, MOUSE_ON, InputDecoder
-from delegate_view.render import paint
+from delegate_view.render import Span, paint
 from delegate_view.scrollbar import (
     grab_offset,
     scroll_for_click,
@@ -54,6 +54,9 @@ SPIN_MS = 110
 # Frame budget. 20fps is imperceptibly different from 50 for this content and
 # leaves the process mostly asleep.
 TICK_MS = 50
+
+# What the conversation pane shows while its body is still being parsed.
+_LOADING_BODY = [[Span("  loading…", "dim")]]
 
 
 def resolve_key_action(key: int, view: str) -> str:
@@ -122,25 +125,51 @@ class ConversationLoader:
     worker and the screen keeps painting; the body appears when it is ready.
     """
 
+    # How often a live conversation is re-read from disk while it is open.
+    RELOAD_S = 1.0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._want: tuple | None = None
         self._have: tuple | None = None
         self._body: list = []
         self._title = ""
+        self._gen = 0
+        self._loaded_at = 0.0
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._wake = threading.Event()
+
+    @staticmethod
+    def key_for(run) -> tuple:
+        """The identity a load is filed under — same shape the loop compares."""
+        return (getattr(run, "platform", ""), getattr(run, "session_id", ""),
+                getattr(run, "transcript", ""))
 
     def request(self, run) -> None:
-        key = (getattr(run, "platform", ""), getattr(run, "session_id", ""),
-               getattr(run, "transcript", ""))
+        key = self.key_for(run)
         with self._lock:
             self._want = (key, run)
+        # An Event, not a bare thread poke: the old worker exited the moment it
+        # had nothing to do, and a request landing in that gap — after the
+        # is_alive() check saw a thread that was still unwinding — was simply
+        # lost, leaving the conversation pane empty until the next frame's
+        # request happened to win the race. The worker now waits instead of
+        # exiting, so there is no gap to lose a request in.
+        self._wake.set()
         self._ensure_thread()
 
-    def result(self) -> tuple[list, str]:
+    def result(self) -> tuple[list, str, int, tuple | None]:
+        """(body, title, generation, loaded_key).
+
+        The generation changes exactly when the body does, so callers can key
+        caches on it rather than on id(body) — which the allocator is free to
+        hand out again for a new list. `loaded_key` names the conversation the
+        body belongs to, so a caller that just asked for a different one can
+        tell it is looking at the previous answer.
+        """
         with self._lock:
-            return self._body, self._title
+            return self._body, self._title, self._gen, self._have
 
     def _ensure_thread(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -150,21 +179,29 @@ class ConversationLoader:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
     def _work(self) -> None:
         while not self._stop.is_set():
+            self._wake.wait(timeout=self.RELOAD_S)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
             with self._lock:
                 want = self._want
+                have = self._have
+                loaded_at = self._loaded_at
             if want is None:
-                return
+                continue
             key, run = want
-            if key == self._have:
-                # Live runs keep growing, so re-read on a slow cadence.
+            if key == have:
+                # Already showing this conversation. Only live runs keep
+                # growing, and those re-read on a slow cadence rather than at
+                # frame rate — request() fires every paint.
                 if not getattr(run, "live", False):
-                    return
-                self._stop.wait(1.0)
-                if self._stop.is_set():
-                    return
+                    continue
+                if time.monotonic() - loaded_at < self.RELOAD_S:
+                    continue
             try:
                 body, title = _load_body(run)
             except Exception:
@@ -173,8 +210,23 @@ class ConversationLoader:
                 if self._want and self._want[0] == key:
                     self._body, self._title = body, title
                     self._have = key
-            if self._want and self._want[0] != key:
-                continue
+                    self._gen += 1
+                    self._loaded_at = time.monotonic()
+
+
+def _run_is_subagent(run) -> bool:
+    """Whether another agent, not a person, started this conversation.
+
+    `is_subagent` is authoritative when the run list provides it. The old
+    inference — no prompt file means an agent spawned it — mislabels a chat
+    you started yourself in opencode, which also has no prompt file, and the
+    label decides whether the "user" turns are attributed to you or to an
+    agent. The fallback survives only for run objects predating the field.
+    """
+    flag = getattr(run, "is_subagent", None)
+    if flag is not None:
+        return bool(flag)
+    return not getattr(run, "prompt", "")
 
 
 def _load_body(run) -> tuple[list, str]:
@@ -184,7 +236,7 @@ def _load_body(run) -> tuple[list, str]:
     title = views.run_title(run)[0] or "conversation"
     platform = getattr(run, "platform", "") or ""
     sid = getattr(run, "session_id", "") or ""
-    is_subagent = not getattr(run, "prompt", "")
+    is_subagent = _run_is_subagent(run)
 
     if platform and sid:
         session = adapters.load_session(platform, sid)
@@ -268,8 +320,13 @@ def _curses_main(stdscr, store, args):
     curses.curs_set(0)
     curses.set_escdelay(25)
     stdscr.keypad(True)
+    # timeout() is what makes getch return -1 after TICK_MS so the loop can
+    # repaint on its own. nodelay(False) used to follow it and undid it: in
+    # ncurses both write the same per-window delay field, and "blocking" wins
+    # whichever way you spell it. The result was a UI that only redrew when you
+    # pressed a key — no spinner, no live token counts, and a list that still
+    # said "0 runs" long after the store had loaded forty of them.
     stdscr.timeout(TICK_MS)
-    stdscr.nodelay(False)
 
     theme = Theme()
     theme.start()
@@ -294,6 +351,7 @@ def _curses_main(stdscr, store, args):
     last_spin = 0.0
     dragging = None      # ("convo"|"list", grab_offset) while a drag is active
     body: list = []
+    body_gen = 0
     wrapped: list = []
     wrapped_key = None
     title = ""
@@ -328,16 +386,23 @@ def _curses_main(stdscr, store, args):
 
         if view == "convo" and runs:
             loader.request(runs[sel])
-            body, title = loader.result()
+            body, title, body_gen, loaded_key = loader.result()
+            if loaded_key != ConversationLoader.key_for(runs[sel]):
+                # The worker has not finished this conversation yet. Showing
+                # the previously opened one here put another conversation's
+                # words under this one's title for a frame or two — worse
+                # than a beat of "loading".
+                title = views.run_title(runs[sel])[0] or "conversation"
+                body, body_gen = _LOADING_BODY, -1
 
         # Wrap once, here, and use the SAME list for painting and for scroll
         # limits. Wrapping separately in the renderer is what made the last
         # screenful of a long conversation unreachable — the loop's idea of
         # how many lines there were came from the unwrapped blocks.
         convo_w = _convo_width(w, split)
-        if (id(body), convo_w) != wrapped_key:
+        if (body_gen, convo_w) != wrapped_key:
             wrapped = views.wrap_body(body, convo_w)
-            wrapped_key = (id(body), convo_w)
+            wrapped_key = (body_gen, convo_w)
 
         now_ms = int(time.time() * 1000)
         try:
@@ -375,9 +440,17 @@ def _curses_main(stdscr, store, args):
                 res = _handle_mouse(value, view, split, runs, sel, scroll,
                                     list_scroll, w, h, len(wrapped), dragging)
                 sel, scroll, list_scroll, dragging, opened = res
-                if opened and runs:
+                if opened:
                     view = "convo"
                     scroll = 0
+                # The mouse moves the selection exactly like the keys do, so it
+                # has to re-anchor sel_key exactly like the keys do. It used to
+                # set it only when a click *opened* a run, which meant the top
+                # of the next frame found sel_key still naming the old run and
+                # snapped `sel` straight back — a wheel that did nothing and a
+                # click that did nothing, from a handler that was computing the
+                # right answer all along.
+                if runs and 0 <= sel < len(runs):
                     sel_key = _key_of(runs[sel])
             else:
                 action = resolve_key_action(value, view)
@@ -506,7 +579,7 @@ def _handle_mouse(ev, view, split, runs, sel, scroll, list_scroll, w, h,
         return sel, scroll, list_scroll, ("convo", 0), opened
 
     if view == "list" or (split and ev.x < _list_width(w)):
-        idx = _row_to_index(ev.y, list_scroll)
+        idx = _row_to_index(ev.y, list_scroll, h)
         if idx is not None and 0 <= idx < len(runs):
             if idx == sel:
                 opened = True
@@ -528,9 +601,19 @@ def _body_top() -> int:
     return 2
 
 
-def _row_to_index(y: int, list_scroll: int) -> int | None:
-    """Which run a screen row belongs to, or None for header/footer/blank."""
-    body_y = y - _body_top() + list_scroll
+def _row_to_index(y: int, list_scroll: int, height: int) -> int | None:
+    """Which run a screen row belongs to, or None for header/footer/blank.
+
+    `height` is not decoration: the row arithmetic alone happily answers for
+    rows the list does not occupy. On a scrolled list the header row came back
+    as `list_scroll // 3` and the footer as the run one past the bottom of the
+    viewport, so clicking the title bar selected something off-screen and
+    clicking the key hints opened it. Only rows inside the body are runs.
+    """
+    top = _body_top()
+    if y < top or y >= top + views.list_body_height(height):
+        return None
+    body_y = y - top + list_scroll
     if body_y < 0:
         return None
     per_item = views.ROWS_PER_RUN + 1

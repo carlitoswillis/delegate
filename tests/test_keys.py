@@ -102,13 +102,51 @@ class InputDecoderTests(unittest.TestCase):
         got += [x for x in (dec.feed(-1),) if x is not None]
         self.assertEqual(got, [("key", ESC), ("key", ord("q"))])
 
-    def test_non_mouse_escape_sequence_replays_its_bytes(self):
+    def test_unknown_csi_sequence_is_swallowed_whole(self):
+        # Anything still arriving as ESC[... has already failed curses' own
+        # keypad translation, so it is a report the terminal sent unasked.
+        # Replaying it emitted a leading ESC — and ESC quits the list view.
         dec = InputDecoder()
         got = _feed_str(dec, "\033[A")     # a bare arrow-key sequence
         while (x := dec.feed(-1)) is not None:
             got.append(x)
-        self.assertEqual(got, [("key", ESC), ("key", ord("[")), ("key", ord("A"))])
+        self.assertEqual(got, [])
         self.assertEqual(dec.feed(ord("j")), ("key", ord("j")))
+
+    def test_terminal_chatter_never_produces_an_escape(self):
+        # These arrive without the user touching the keyboard: focus in/out
+        # when the window is clicked, and the markers around a paste. Each one
+        # used to quit the app.
+        for chatter in ("\033[I", "\033[O", "\033[200~", "\033[201~",
+                        "\033[?1;2c", "\033[12;40R"):
+            dec = InputDecoder()
+            got = _feed_str(dec, chatter)
+            while (x := dec.feed(-1)) is not None:
+                got.append(x)
+            self.assertNotIn(("key", ESC), got, chatter)
+            self.assertEqual(dec.feed(ord("j")), ("key", ord("j")), chatter)
+
+    def test_paste_body_still_arrives_as_keys(self):
+        # Swallowing the markers must not swallow what was pasted between them.
+        dec = InputDecoder()
+        got = _feed_str(dec, "\033[200~jk\033[201~")
+        while (x := dec.feed(-1)) is not None:
+            got.append(x)
+        self.assertEqual(got, [("key", ord("j")), ("key", ord("k"))])
+
+    def test_lone_escape_comes_out_on_the_idle_tick(self):
+        # Esc has to work on its own. Held for a byte that never comes, it made
+        # the key feel dead until the user pressed something else.
+        dec = InputDecoder()
+        self.assertIsNone(dec.feed(ESC))
+        self.assertEqual(dec.feed(-1), ("key", ESC))
+        self.assertIsNone(dec.feed(-1))
+
+    def test_truncated_sequence_is_dropped_on_the_idle_tick(self):
+        dec = InputDecoder()
+        _feed_str(dec, "\033[<65;1")
+        self.assertIsNone(dec.feed(-1))
+        self.assertEqual(dec.feed(ord("q")), ("key", ord("q")))
 
     def test_runaway_sequence_is_dropped_not_replayed(self):
         # A 32+ byte "mouse body" is line noise, not typing. Replaying it

@@ -5,6 +5,8 @@
 #   delegate run task.md          hand task.md to another model
 #   delegate run -c followup.md   continue the last session
 #   delegate watch                live view of agent conversations
+#   delegate serve                read the transcripts in a browser
+#   delegate serve --tunnel       ...and from your phone, anywhere
 #   delegate ls                   list recent runs
 #   delegate install              symlink this onto your PATH
 #
@@ -24,7 +26,7 @@ while [ -L "$SELF" ]; do
 done
 ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
 
-usage() { sed -n '3,10p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,12p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 CMD="${1:-}"; shift || true
 
@@ -37,6 +39,13 @@ case "$CMD" in
     exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
       python3 -m delegate_view.watch "$@"
     ;;
+  serve)
+    # Same PYTHONPATH trick as `watch`: importable straight from the repo,
+    # no install step. Stdlib only on the other side, so this runs on the
+    # system python3 without a virtualenv.
+    exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m delegate_view.web "$@"
+    ;;
   ls)
     exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$@" <<'PY'
 import datetime, sys
@@ -48,9 +57,15 @@ if not runs:
     sys.exit(0)
 for r in runs:
     when = datetime.datetime.fromtimestamp(r.started / 1000).strftime("%m-%d %H:%M")
-    mark = "● live" if r.live else "·     "
+    if r.live:
+        mark = "● live"
+    elif r.failed:
+        mark = "✗ fail"
+    else:
+        mark = "·     "
     name = r.prompt.rsplit("/", 1)[-1]
-    print(f"{mark}  {when}  {r.model:<24} {name:<28} {r.size:>8}B")
+    tail = f"  {r.end_reason}" if r.failed and r.end_reason else ""
+    print(f"{mark}  {when}  {r.model:<24} {name:<28} {r.size:>8}B{tail}")
 PY
     ;;
   install)
