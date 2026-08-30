@@ -94,17 +94,26 @@ class ListMarkerTests(unittest.TestCase):
             self.assertNotIn(frame, out)
 
 
+def _marked_rows(out):
+    """Body rows carrying the selection edge — the header's brand edge on
+    row 0 is the same glyph doing a different job, so it is excluded."""
+    return [i for i, ln in enumerate(out)
+            if i >= 2 and ln.startswith(views.RULE)]
+
+
 class SelectionMarkerTests(unittest.TestCase):
-    def test_selected_row_is_marked(self):
+    def test_selected_item_carries_the_edge_on_both_its_rows(self):
         out = _plain(views.render_list(_runs(3), 0, 80, 16, NOW))
-        self.assertTrue(any("▸" in ln for ln in out))
+        marked = _marked_rows(out)
+        self.assertEqual(len(marked), 2, "title row and meta row")
+        self.assertEqual(marked[1], marked[0] + 1, "adjacent rows, one item")
 
     def test_marker_is_on_the_selected_row_not_another(self):
         for sel in (0, 1, 2):
             out = _plain(views.render_list(_runs(3), sel, 80, 20, NOW))
-            marked = [ln for ln in out if "▸" in ln]
-            self.assertEqual(len(marked), 1, f"sel={sel}")
-            self.assertIn(f"t{sel}", marked[0], f"sel={sel}")
+            marked = _marked_rows(out)
+            self.assertEqual(len(marked), 2, f"sel={sel}")
+            self.assertIn(f"t{sel}", out[marked[0]], f"sel={sel}")
 
     def test_selected_differs_from_unselected_for_the_same_run(self):
         a = _plain(views.render_list(_runs(2), 0, 80, 16, NOW))
@@ -114,7 +123,7 @@ class SelectionMarkerTests(unittest.TestCase):
     def test_a_live_selected_run_is_still_marked(self):
         out = _plain(views.render_list(
             [FakeRun(live=True), FakeRun(live=True)], 1, 80, 16, NOW))
-        self.assertTrue(any("▸" in ln for ln in out))
+        self.assertTrue(_marked_rows(out))
 
 
 class ListScrollTests(unittest.TestCase):
@@ -509,13 +518,13 @@ class ListScrollMappingTests(unittest.TestCase):
         sel, h = 20, 24
         scroll = views.list_scroll_for(sel, 0, h)
         screen = views.render_list(_runs(40), sel, 80, h, NOW, scroll=scroll)
-        marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
-        self.assertEqual(len(marked), 1)
+        marked = _marked_rows(_plain(screen))
+        self.assertEqual(len(marked), 2, "title row and meta row")
         self.assertEqual(_row_to_index(marked[0], scroll, h), sel)
 
     def test_click_maps_correctly_at_the_top_of_an_unscrolled_list(self):
         screen = views.render_list(_runs(10), 0, 80, 24, NOW, scroll=0)
-        marked = [i for i, ln in enumerate(screen) if "▸" in text_of(ln)]
+        marked = _marked_rows(_plain(screen))
         self.assertEqual(_row_to_index(marked[0], 0, 24), 0)
 
 

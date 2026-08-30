@@ -104,6 +104,17 @@ def run_title(run) -> tuple[str, bool]:
 
 # ── list view ───────────────────────────────────────────────────────────
 
+def _sel(line: Line) -> Line:
+    """A line restyled onto the selection band.
+
+    Every span gets its `sel.` twin, so the band's background runs THROUGH
+    the text instead of around it — the old reverse-video treatment
+    highlighted the padding and left the words on the default background,
+    which read as a broken streak rather than a selected row.
+    """
+    return [Span(s.text, "sel." + (s.style or "default")) for s in line]
+
+
 def _run_rows(run, *, selected: bool, width: int, now_ms: int,
               spin_frame: int, expanded: bool) -> list[Line]:
     """The two lines one run occupies."""
@@ -122,46 +133,57 @@ def _run_rows(run, *, selected: bool, width: int, now_ms: int,
     else:
         marker = Span("·", "idle")
 
-    gutter = Span("▸ " if selected else "  ", "selected" if selected else "")
+    # The selection edge is the same rule the conversation view draws beside
+    # a speaker: in the list it marks the conversation being read. It runs
+    # down both rows of the item, so the two lines read as one thing.
+    gutter = Span(RULE + " " if selected else "  ", "accent")
 
-    # Title line: marker, title on the left, model on the right.
+    # Title line: marker, title on the left, model on the right. Regular
+    # weight — when every title was bold, none was, and the selected row's
+    # bold (via sel.title) had nothing to stand out from.
     model_w = min(len(model_short), max(0, width // 3))
     left_w = max(4, width - model_w - 8)
-    # Both kinds now truncate from the end: a task name and a prose title both
+    # Both kinds truncate from the end: a task name and a prose title both
     # say what they are in their opening words.
-    title_line = truncate(line_of(Span(title or "(untitled)", "head")), left_w)
+    title_line = truncate(
+        line_of(Span(title or "(untitled)", "title" if title else "dim")),
+        left_w)
 
     head = line_of(gutter, marker, Span(" "), title_line)
-    head = pad(head, width - model_w - 2, "selected" if selected else "")
+    head = pad(head, width - model_w - 2)
     head = hstack(head,
                   line_of(Span(model_short, style_for_model(model))),
                   blank(2))
 
     # Meta line: age, tokens, cost — the detail that does not need to be read
-    # on every row, indented under the title so the eye can skip it.
-    parts: list[str] = [relative_age(now_ms, run.started) + " ago"]
+    # on every row, indented under the title so the eye can skip it. Each
+    # fact keeps its own colour: teal for tokens, green for money, red for
+    # the reason a run died — so the row can be scanned without being read.
+    meta_bits: list[tuple[str, str]] = [
+        (relative_age(now_ms, run.started) + " ago", "age")]
     tokens = getattr(run, "tokens_in", 0) + getattr(run, "tokens_out", 0)
+    if tokens:
+        meta_bits.append((format_tokens(tokens) + " tok", "tokens"))
+    cost = format_cost(getattr(run, "cost", 0.0))
+    if cost:
+        meta_bits.append((cost, "cost"))
     if expanded:
-        if tokens:
-            parts.append(format_tokens(tokens) + " tok")
-        cost = format_cost(getattr(run, "cost", 0.0))
-        if cost:
-            parts.append(cost)
         cwd = getattr(run, "cwd", "") or ""
         if cwd:
-            parts.append(cwd.rsplit("/", 1)[-1])
-    else:
-        if tokens:
-            parts.append(format_tokens(tokens) + " tok")
-        cost = format_cost(getattr(run, "cost", 0.0))
-        if cost:
-            parts.append(cost)
-
+            meta_bits.append((cwd.rsplit("/", 1)[-1], "age"))
     if getattr(run, "failed", False) and getattr(run, "end_reason", ""):
-        parts.append(run.end_reason)
+        meta_bits.append((run.end_reason, "error"))
 
-    meta = line_of(Span("     "), Span(" · ".join(parts), "age"))
-    meta = pad(truncate(meta, width), width)
+    meta_spans: list[Span] = [Span(RULE + "    " if selected else "     ",
+                                   "accent")]
+    for i, (text, style) in enumerate(meta_bits):
+        if i:
+            meta_spans.append(Span(" · ", "dim"))
+        meta_spans.append(Span(text, style))
+    meta = pad(truncate(line_of(*meta_spans), width), width)
+
+    if selected:
+        return [_sel(head), _sel(meta)]
     return [head, meta]
 
 
@@ -172,14 +194,17 @@ def render_list(runs, selected: int, width: int, height: int, now_ms: int,
     lines: list[Line] = []
 
     live = sum(1 for r in runs if r.live)
-    bits = [f"{len(runs)} run{'s' if len(runs) != 1 else ''}"]
+    right_spans: list[Span] = [
+        Span(f"{len(runs)} run{'s' if len(runs) != 1 else ''}", "dim")]
     if live:
-        bits.append(f"{live} live")
+        # The one number worth colour up here: it answers "is anything
+        # moving" from across the room, in the same cyan as the spinners.
+        right_spans += [Span(" · ", "dim"), Span(f"{live} live", "live")]
     if status:
-        bits.append(status)
+        right_spans += [Span(" · ", "dim"), Span(status, "dim")]
 
-    header = line_of(Span("  delegate", "head"))
-    right = line_of(Span(" · ".join(bits), "dim"))
+    header = line_of(Span(RULE + " ", "accent"), Span("delegate", "brand"))
+    right = line_of(*right_spans)
     gap = max(1, width - width_of(header) - width_of(right) - 2)
     lines.append(hstack(header, blank(gap), right, blank(2)))
     lines.append([])
@@ -243,10 +268,20 @@ def list_scroll_for(selected: int, scroll: int, height: int) -> int:
 
 def _footer(width: int, view: str) -> Line:
     if view == "list":
-        text = "  ↑↓ move   ↵ open   tab detail   r refresh   q quit"
+        hints = [("↑↓", "move"), ("↵", "open"), ("tab", "detail"),
+                 ("r", "refresh"), ("q", "quit")]
     else:
-        text = "  ↑↓ scroll   esc back   g/G top/bottom   q quit"
-    return pad(line_of(Span(text, "dim")), width)
+        hints = [("↑↓", "scroll"), ("esc", "back"),
+                 ("g/G", "top/bottom"), ("q", "quit")]
+    # The key brighter than its label: a footer is scanned for the key, and
+    # when the whole line is one grey the eye has to read it instead.
+    spans: list[Span] = [Span("  ")]
+    for i, (key, label) in enumerate(hints):
+        if i:
+            spans.append(Span("   "))
+        spans.append(Span(key, "key"))
+        spans.append(Span(" " + label, "dim"))
+    return pad(line_of(*spans), width)
 
 
 # ── conversation view ───────────────────────────────────────────────────
@@ -271,9 +306,13 @@ def session_blocks(session, *, platform: str = "", model: str = "",
                                   is_subagent=is_subagent)
             style = "user" if ev.role == "user" else "assistant"
             edge = "edge.user" if ev.role == "user" else "edge.assistant"
+            # The name takes its side's colour, so the rule beside the text
+            # and the header above it read as one voice.
+            who_style = ("speaker.user" if ev.role == "user"
+                         else "speaker.assistant")
             if who != last_speaker:
                 out.append([])
-                out.append(line_of(Span("  "), Span(who, "speaker")))
+                out.append(line_of(Span("  "), Span(who, who_style)))
                 last_speaker = who
             body = ev.text.replace("\r\n", "\n").replace("\r", "\n")
             for para in body.split("\n"):
@@ -377,7 +416,8 @@ def render_convo(title: str, wrapped: list[Line], scroll: int,
                  width: int, height: int) -> list[Line]:
     """Full-screen conversation. `wrapped` must come from `wrap_body`."""
     lines: list[Line] = []
-    lines.append(pad(line_of(Span("  "), Span(title, "head")), width))
+    lines.append(pad(line_of(Span(RULE + " ", "accent"), Span(title, "head")),
+                     width))
     lines.append([])
 
     body_h = convo_body_height(height)
