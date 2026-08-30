@@ -346,15 +346,21 @@ class Handler(BaseHTTPRequestHandler):
 # ── lifecycle ───────────────────────────────────────────────────────────
 
 def make_server(port: int = DEFAULT_PORT, *, token: str,
+                host: str = "127.0.0.1",
                 ledger_path=None, limit_per_source=None,
                 quiet: bool = False, tries: int = 10) -> DelegateWeb:
-    """A server bound to 127.0.0.1, walking forward if the port is taken.
+    """A server bound to `host`, walking forward if the port is taken.
 
-    Loopback only, always, with no option to change it.  The security model is
-    "nothing but the tunnel can reach this", and an interface flag is the one
-    line of config that would quietly turn a token-protected local service into
-    an open one on a coffee shop network.  If you want it reachable, use the
-    tunnel — that path at least terminates TLS.
+    Loopback by default.  The original stance was loopback with no option at
+    all — "nothing but the tunnel can reach this" — because an interface flag
+    is the one line of config that quietly turns a token-protected local
+    service into one answering a coffee shop network.  `host` exists for a
+    narrower case that stance didn't serve: a private network you already
+    trust end to end (a home LAN, a Tailscale tailnet), where a phone should
+    be able to open the page without a public tunnel in the middle.  The
+    token is still demanded on every request either way; binding wider
+    changes who can reach the 401, not who can read a transcript.  The CLI
+    only offers this behind an explicit --lan/--bind, never as a default.
 
     Walking the port forward matters because the common case is a second
     `delegate serve` while the first is still running, and failing with
@@ -365,7 +371,7 @@ def make_server(port: int = DEFAULT_PORT, *, token: str,
     last: OSError | None = None
     for offset in range(max(1, tries)):
         try:
-            return DelegateWeb(("127.0.0.1", port + offset), Handler,
+            return DelegateWeb((host, port + offset), Handler,
                                token=token, index=index, cache=cache,
                                quiet=quiet)
         except OSError as exc:

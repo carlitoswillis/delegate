@@ -57,8 +57,16 @@ transcripts as an ordinary web page, built for a phone screen:
 
 ```sh
 delegate serve              # local only: http://127.0.0.1:8787
+delegate serve --lan        # ...also reachable on your LAN / tailnet
 delegate serve --tunnel     # ...also reachable from anywhere
 ```
+
+`--lan` is the right middle for a network you already trust end to end — a
+home wifi, a Tailscale tailnet. The page becomes reachable by hostname (and
+shows up as a tappable link in port dashboards like portboard), no tunnel in
+the middle, and the access token is still demanded on every request. Use
+`--bind <addr>` instead to listen on one specific interface — e.g. your
+Tailscale IP, reachable over the tailnet but not the coffee shop wifi.
 
 Both print a URL with an access token already in it. Copy that one string to
 your phone and you are in — there is no login, no account, and nothing to set
@@ -106,8 +114,9 @@ link you copy to your phone carries your token — treat it like a password.
 Anyone holding the full URL can read every transcript on this machine, which
 includes source code, file paths, and whatever your task files said.
 
-Mitigations that are already in place: the server binds `127.0.0.1` only, with
-no flag to change that, so nothing but the tunnel can reach it; there is no
+Mitigations that are already in place: the server binds `127.0.0.1` unless
+you explicitly widen it (`--lan` / `--bind` are opt-in, never the default),
+so out of the box nothing but the tunnel can reach it; there is no
 `POST` surface, so nothing on the page can change anything; transcript content
 is HTML-escaped everywhere and served under a `default-src 'none'` CSP,
 because agents write `<script>` tags all day and an unescaped tool output

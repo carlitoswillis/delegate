@@ -788,6 +788,26 @@ def test_cli_parses_the_flags():
     assert args.tunnel is True
     assert args.limit == 10
     assert build_parser().parse_args([]).tunnel is False
+    assert build_parser().parse_args([]).lan is False
+    assert build_parser().parse_args([]).bind is None
+    assert build_parser().parse_args(["--lan"]).lan is True
+    assert build_parser().parse_args(["--bind", "100.1.2.3"]).bind == "100.1.2.3"
+
+
+def test_server_binds_loopback_unless_told_otherwise():
+    """Widening the bind is opt-in, never a default — the security section
+    of the README leans on this."""
+    default = server.make_server(0, token=TOKEN, quiet=True)
+    try:
+        assert default.server_address[0] == "127.0.0.1"
+    finally:
+        default.server_close()
+
+    wide = server.make_server(0, token=TOKEN, quiet=True, host="0.0.0.0")
+    try:
+        assert wide.server_address[0] == "0.0.0.0"
+    finally:
+        wide.server_close()
 
 
 def test_make_server_walks_past_a_busy_port(tmp_path):
