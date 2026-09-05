@@ -1,0 +1,36 @@
+
+===== SENT 2026-09-04 19:55:17 — opencode/some-model =====
+
+Write unit tests for lib/csv_parser.py.
+
+Cover: a quoted field with an embedded comma, an empty field between two
+commas, and a file with no trailing newline. Use pytest and put the new
+tests in tests/test_csv_parser.py next to the existing suite.
+
+===== REPLY =====
+
+Read lib/csv_parser.py. parse_line() already handles quoting; the gap is
+tests, not behavior, so this only adds tests/test_csv_parser.py.
+
+Three cases, one test each:
+
+    def test_quoted_field_with_embedded_comma():
+        assert parse_line('a,"b,c",d') == ["a", "b,c", "d"]
+
+    def test_empty_field_between_commas():
+        assert parse_line("a,,c") == ["a", "", "c"]
+
+    def test_file_with_no_trailing_newline(tmp_path):
+        p = tmp_path / "rows.csv"
+        p.write_bytes(b"a,b,c")  # no trailing \n
+        assert list(parse_file(str(p))) == [["a", "b", "c"]]
+
+The third one is the one worth flagging: parse_file() reads with
+splitlines(), which already tolerates a missing trailing newline, so this
+test passed on the first run rather than catching anything. Leaving it in
+anyway — it is exactly the kind of edge a future change could break
+silently.
+
+Ran pytest tests/test_csv_parser.py: 9 passed, 0 failed.
+
+===== END 2026-09-04 19:57:37 — completed =====

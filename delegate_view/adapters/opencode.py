@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -11,6 +12,10 @@ from delegate_view.schema import Event, Session, norm_dir
 
 
 def default_db_path() -> Path:
+    # See runs.default_ledger_path() for why DELEGATE_HOME exists.
+    home = os.environ.get("DELEGATE_HOME")
+    if home:
+        return Path(home) / "opencode.db"
     return Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 
 

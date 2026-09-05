@@ -46,6 +46,10 @@ def _slug_for_cwd(cwd: str) -> str:
 
 
 def default_db_path() -> Path:
+    # See runs.default_ledger_path() for why DELEGATE_HOME exists.
+    home = os.environ.get("DELEGATE_HOME")
+    if home:
+        return Path(home) / "claude-projects"
     return Path.home() / ".claude" / "projects"
 
 

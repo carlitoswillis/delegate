@@ -1,0 +1,2 @@
+{"started": 1788498917024, "prompt": "examples/demo-runs/add-dry-run-flag.md", "transcript": "examples/demo-runs/add-dry-run-flag-transcript.log", "model": "opencode/some-model", "cwd": "/Users/dev/projects/backup-tools", "continued": false, "pid": 5821}
+{"started": 1788576917024, "prompt": "examples/demo-runs/csv-parser-tests.md", "transcript": "examples/demo-runs/csv-parser-tests-transcript.log", "model": "opencode/some-model", "cwd": "/Users/dev/projects/csv-tools", "continued": false, "pid": 6390}

@@ -128,6 +128,13 @@ def default_ledger_path() -> Path:
     env = os.environ.get("DELEGATE_LEDGER")
     if env:
         return Path(env)
+    # DELEGATE_HOME redirects the whole viewer at an alternate directory —
+    # this ledger plus the adapter roots in adapters/opencode.py and
+    # adapters/claude_code.py — so a demo fixture or a test run never touches
+    # the real ~/.delegate, ~/.local/share/opencode or ~/.claude.
+    home = os.environ.get("DELEGATE_HOME")
+    if home:
+        return Path(home) / "runs.jsonl"
     return Path.home() / ".delegate" / "runs.jsonl"
 
 

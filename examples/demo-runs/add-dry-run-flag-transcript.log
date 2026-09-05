@@ -1,0 +1,37 @@
+
+===== SENT 2026-09-03 22:15:17 — opencode/some-model =====
+
+Add a --dry-run flag to scripts/backup.sh.
+
+It should print exactly what it would archive and what it would delete,
+without touching the filesystem. Keep every existing flag working the same
+way it does today, and add one test to tests/test_backup.sh that exercises
+the new flag.
+
+===== REPLY =====
+
+Read scripts/backup.sh. It builds ARCHIVE[] and DELETE[] arrays in one
+pass and then acts on them in a second pass, so the flag only has to change
+that second pass.
+
+Added --dry-run near the other flag parsing, and a DRY_RUN=0 default next to
+the other option variables. The acting pass now checks it before each tar
+and each rm:
+
+    if [ "$DRY_RUN" = 1 ]; then
+      printf 'would archive: %s\n' "$f"
+    else
+      tar -rf "$ARCHIVE_FILE" "$f"
+    fi
+
+Same shape for the delete branch, with "would delete:" instead. Nothing
+above that point changed, so --verbose, --exclude and the existing archive
+naming behave exactly as before.
+
+Added one case to tests/test_backup.sh: runs backup.sh --dry-run against a
+fixture directory, asserts the fixture files are still present afterward,
+and greps the output for both "would archive" and "would delete" lines.
+
+Ran tests/test_backup.sh: 14 passed, 0 failed.
+
+===== END 2026-09-03 22:16:52 — completed =====
